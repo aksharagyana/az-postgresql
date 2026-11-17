@@ -225,8 +225,8 @@ docker pull ghcr.io/aksharagyana/az-postgresql:latest
 docker buildx imagetools inspect ghcr.io/aksharagyana/az-postgresql:latest
 ```
 
-The Actions run summary includes the multi-platform manifest digest. Deploy
-that digest, not a moving tag. CI publishes images only; it does not deploy to
+The Actions run summary includes the multi-platform manifest digest. Record
+that digest if you need to reuse an exact release later. CI publishes images only; it does not deploy to
 AKS, authenticate to Azure, or run a real managed PITR operation.
 
 ### Manual publishing and AKS
@@ -243,8 +243,8 @@ This uses Buildx to publish **linux/amd64 and linux/arm64**. Use
 `PLATFORMS=linux/amd64` if you need only typical x86 AKS nodes. `docker-build`
 builds/loads only the local architecture unless overridden with, for example,
 `make docker-build PLATFORM=linux/amd64 IMAGE=azure-postgresql-toolbox:amd64`.
-Prefer an immutable image digest for
-deployment and **use the exact same image for backup, restore and validation**.
+For repeatable recovery, an immutable image digest is available as an override.
+**Use the exact same image for backup, restore and validation**.
 Package repositories update over time; rebuilding the same tag is not a
 reproducible client-version pin.
 
@@ -255,23 +255,26 @@ non-root execution. `Recreate` avoids two rollout replicas contending for the
 ReadWriteOnce disk. The readiness check verifies local storage/credential access,
 not database connectivity; no liveness probe kills a long-running operation.
 
-The Deployment is pinned to the verified public multi-architecture GHCR image
-from source commit `020c3f90b5e857535dc8067fd3c01705a6eb946c`:
+The temporary interactive Deployment uses the public multi-architecture image:
 
 ```text
-ghcr.io/aksharagyana/az-postgresql@sha256:d354dbeefb8642623b6a082caa2c913430f5552de7e5282a77772181c031727e
+ghcr.io/aksharagyana/az-postgresql:latest
 ```
 
 `make aks-render` and `make aks-deploy` default to the image in
 `k8s/deployment.yaml`, not the local Docker build tag. An explicit `IMAGE=...`
-still overrides it. Update the manifest pin after verifying a newer release;
-CI publishing `latest` does not automatically roll this Deployment.
+still overrides it. `imagePullPolicy: Always` resolves the tag on each container
+start; CI publishing `latest` does not restart an already running container.
+Keep the same container throughout backup, restore and validation. A restart
+can pick up a newer release, so record the actual image digest with your backup
+records and use `IMAGE=ghcr.io/aksharagyana/az-postgresql@sha256:...` if you need
+that exact release for later recovery.
 
 Before deploying:
 
 1. Confirm the AKS cluster/context and approved namespace. Restrict permission to
    exec into this pod and read its Secret/PVC; this pod has database admin access.
-2. Ensure AKS can reach `ghcr.io` and its image download endpoints. The pinned
+2. Ensure AKS can reach `ghcr.io` and its image download endpoints. The public
    package supports anonymous pulls, so no GHCR pull Secret is required.
    If overriding with a private registry, configure its pull permissions.
    Logical operations need no Azure API credentials;
@@ -298,7 +301,7 @@ kubectl create namespace postgres-migration --dry-run=client -o yaml | kubectl a
 kubectl -n postgres-migration create secret generic postgres-toolbox-pgpass \
   --from-file=pgpass=/absolute/secure/path/pgpass
 
-# Review generated manifests before applying; uses the pinned GHCR digest.
+# Review generated manifests before applying; uses GHCR latest with Always pull.
 make aks-render
 make aks-deploy
 make aks-shell
