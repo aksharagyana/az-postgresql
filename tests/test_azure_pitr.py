@@ -2,6 +2,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -62,14 +63,20 @@ class ManagedPitrTests(unittest.TestCase):
             "fullyQualifiedDomainName": "recovery16.postgres.database.azure.com",
         }
 
-    def take_backup(self):
-        with patch.object(self.tool, "az_json", side_effect=[
+    def take_backup(self, upload_error=None, **options):
+        responses = [
             {"id": SUBSCRIPTION, "tenantId": TENANT},
             self.source, [], self.backup, self.backup, self.source,
-        ]) as azure:
+        ]
+        if options.get("storage_account"):
+            responses.extend([
+                {"suffixes": {"storageEndpoint": "core.windows.net"}},
+                upload_error or {},
+            ])
+        with patch.object(self.tool, "az_json", side_effect=responses) as azure:
             result = self.tool.take_pitr_backup(
                 SUBSCRIPTION, "source-rg", "source16", self.checkpoint,
-                backup_name="preupgrade", quiesced=True,
+                backup_name="preupgrade", quiesced=True, **options,
             )
         return result, azure
 
@@ -205,6 +212,158 @@ class ManagedPitrTests(unittest.TestCase):
                     confirm_target="recovery16",
                 )
         self.assertEqual(json.loads(self.report.read_text())["status"], "restore_requested")
+
+    def test_optional_blob_upload_uses_timestamp_prefix_and_entra_without_overwrite(self):
+        record, azure = self.take_backup(storage_account="migrationstore", blob_container="pitr")
+        command = azure.call_args_list[-1].args
+        self.assertEqual(command[:3], ("storage", "blob", "upload"))
+        self.assertEqual(command[command.index("--auth-mode") + 1], "login")
+        self.assertEqual(command[command.index("--overwrite") + 1], "false")
+        self.assertEqual(command[command.index("--file") + 1], str(self.checkpoint))
+        name = command[command.index("--name") + 1]
+        self.assertRegex(name, r"^\d{14}/checkpoint\.json$")
+        timestamp = datetime.strptime(name.split("/")[0], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        self.assertLess(abs((datetime.now(timezone.utc) - timestamp).total_seconds()), 30)
+        self.assertEqual(
+            record["checkpoint_blob_url"],
+            "https://migrationstore.blob.core.windows.net/pitr/" + name,
+        )
+        self.assertEqual(json.loads(self.checkpoint.read_text()), record)
+
+    def test_invalid_or_incomplete_blob_destination_does_not_start_backup(self):
+        for options in (
+            {"storage_account": "migrationstore"},
+            {"blob_container": "pitr"},
+            {"storage_account": "INVALID", "blob_container": "pitr"},
+            {"storage_account": "migrationstore", "blob_container": "bad--container"},
+        ):
+            with self.subTest(options=options), patch.object(self.tool, "az_json") as azure:
+                with self.assertRaises(self.tool.PitrError):
+                    self.tool.take_pitr_backup(
+                        SUBSCRIPTION, "source-rg", "source16", self.checkpoint,
+                        quiesced=True, **options,
+                    )
+                azure.assert_not_called()
+
+    def test_blob_upload_failure_preserves_completed_local_reference_and_fails(self):
+        with self.assertRaisesRegex(self.tool.PitrError, "upload"):
+            self.take_backup(
+                storage_account="migrationstore", blob_container="pitr",
+                upload_error=self.tool.PitrError("Storage authorization denied"),
+            )
+        self.assertEqual(json.loads(self.checkpoint.read_text())["status"], "backup_ready")
+
+    def test_blob_restore_downloads_private_reference_before_any_server_operation(self):
+        record, _ = self.take_backup()
+        contents = json.dumps(record)
+        self.checkpoint.unlink()
+        responses = iter([
+            {"id": SUBSCRIPTION, "tenantId": TENANT},
+            self.source, self.backup, [], self.target, self.target,
+        ])
+
+        def az(*arguments):
+            if arguments[:3] == ("storage", "blob", "show"):
+                return {"properties": {"contentLength": len(contents), "etag": '"test-etag"'}}
+            if arguments[:3] == ("storage", "blob", "download"):
+                Path(arguments[arguments.index("--file") + 1]).write_text(contents)
+                return {}
+            return next(responses)
+
+        url = "https://migrationstore.blob.core.windows.net/pitr/20261117124525/checkpoint.json"
+        with patch.object(self.tool, "az_json", side_effect=az) as azure:
+            result = self.tool.restore_pitr_backup(
+                self.checkpoint, "recovery-rg", "recovery16", self.report,
+                confirm_target="recovery16", checkpoint_url=url,
+            )
+        self.assertEqual(result["status"], "server_ready")
+        self.assertEqual(self.checkpoint.stat().st_mode & 0o777, 0o600)
+        download = azure.call_args_list[1].args
+        self.assertEqual(download[:3], ("storage", "blob", "download"))
+        self.assertEqual(download[download.index("--auth-mode") + 1], "login")
+        self.assertEqual(download[download.index("--blob-url") + 1], url)
+        self.assertEqual(download[download.index("--if-match") + 1], '"test-etag"')
+        self.assertEqual(azure.call_args_list[2].args[:2], ("account", "show"))
+
+    def test_blob_restore_rejects_unsafe_urls_and_existing_destination(self):
+        for url in (
+            "http://migrationstore.blob.core.windows.net/pitr/reference.json",
+            "https://migrationstore.blob.core.windows.net/pitr/reference.json?sig=not-allowed",
+            "https://example.com/pitr/reference.json",
+            "https://migrationstore.blob.core.windows.net/pitr/",
+            "https://user@migrationstore.blob.core.windows.net/pitr/reference.json",
+        ):
+            with self.subTest(url=url), patch.object(self.tool, "az_json") as azure:
+                with self.assertRaises(self.tool.PitrError):
+                    self.tool.restore_pitr_backup(
+                        self.checkpoint, "recovery-rg", "recovery16", self.report,
+                        confirm_target="recovery16", checkpoint_url=url,
+                    )
+                azure.assert_not_called()
+        self.take_backup()
+        with patch.object(self.tool, "az_json") as azure:
+            with self.assertRaisesRegex(self.tool.PitrError, "already exists"):
+                self.tool.restore_pitr_backup(
+                    self.checkpoint, "recovery-rg", "recovery16", self.report,
+                    confirm_target="recovery16",
+                    checkpoint_url="https://migrationstore.blob.core.windows.net/pitr/reference.json",
+                )
+            azure.assert_not_called()
+
+    def test_failed_oversized_or_invalid_blob_never_creates_server_or_checkpoint(self):
+        url = "https://migrationstore.blob.core.windows.net/pitr/reference.json"
+        for size in (0, 1024 * 1024 + 1):
+            with self.subTest(size=size), patch.object(self.tool, "az_json", return_value={
+                "properties": {"contentLength": size, "etag": '"test-etag"'},
+            }) as azure:
+                with self.assertRaisesRegex(self.tool.PitrError, "size"):
+                    self.tool.restore_pitr_backup(
+                        self.checkpoint, "recovery-rg", "recovery16", self.report,
+                        confirm_target="recovery16", checkpoint_url=url,
+                    )
+                self.assertEqual(azure.call_count, 1)
+
+        def az(*arguments):
+            if arguments[:3] == ("storage", "blob", "show"):
+                return {"properties": {"contentLength": 8, "etag": '"test-etag"'}}
+            Path(arguments[arguments.index("--file") + 1]).write_text("not json")
+            return {}
+
+        with patch.object(self.tool, "az_json", side_effect=az) as azure:
+            with self.assertRaises(ValueError):
+                self.tool.restore_pitr_backup(
+                    self.checkpoint, "recovery-rg", "recovery16", self.report,
+                    confirm_target="recovery16", checkpoint_url=url,
+                )
+            self.assertEqual(azure.call_count, 2)
+        with patch.object(self.tool, "az_json", side_effect=[
+            {"properties": {"contentLength": 8, "etag": '"test-etag"'}},
+            self.tool.PitrError("Download denied"),
+        ]):
+            with self.assertRaisesRegex(self.tool.PitrError, "denied"):
+                self.tool.restore_pitr_backup(
+                    self.checkpoint, "recovery-rg", "recovery16", self.report,
+                    confirm_target="recovery16", checkpoint_url=url,
+                )
+        self.assertFalse(self.checkpoint.exists())
+        self.assertFalse(self.report.exists())
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_storage_key_environment_is_not_inherited_by_azure_cli(self):
+        with patch.dict(os.environ, {
+            "AZURE_STORAGE_KEY": "synthetic-test-key",
+            "AZURE_STORAGE_SAS_TOKEN": "synthetic-test-sas",
+            "AZURE_STORAGE_CONNECTION_STRING": "synthetic-test-connection",
+        }), patch.object(self.tool.shutil, "which", return_value="/usr/bin/az"), patch.object(
+            self.tool.subprocess, "run",
+        ) as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = "{}"
+            run.return_value.stderr = ""
+            self.tool.az_json("storage", "blob", "show", "--auth-mode", "login")
+        environment = run.call_args.kwargs["env"]
+        for name in ("AZURE_STORAGE_KEY", "AZURE_STORAGE_SAS_TOKEN", "AZURE_STORAGE_CONNECTION_STRING"):
+            self.assertNotIn(name, environment)
 
 
 if __name__ == "__main__":

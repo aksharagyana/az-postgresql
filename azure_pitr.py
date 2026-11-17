@@ -11,9 +11,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
 from server_backup import BackupError, private_files, write_json
+
+
+STORAGE_SUFFIXES = ("core.windows.net", "core.usgovcloudapi.net", "core.chinacloudapi.cn")
+MAX_CHECKPOINT_BYTES = 1024 * 1024
 
 
 class PitrError(BackupError):
@@ -26,7 +31,10 @@ def az_json(*arguments: str) -> dict | list:
     result = subprocess.run(
         ["az", *arguments, "--output", "json", "--only-show-errors"],
         capture_output=True, text=True, check=False,
-        env={**os.environ, "AZURE_CORE_COLLECT_TELEMETRY": "no"},
+        env={
+            **{key: value for key, value in os.environ.items() if not key.startswith("AZURE_STORAGE_")},
+            "AZURE_CORE_COLLECT_TELEMETRY": "no",
+        },
     )
     if result.returncode:
         raise PitrError(f"Azure CLI failed ({result.returncode}):\n{result.stderr.strip()}")
@@ -111,13 +119,66 @@ def replace_record(path: Path, record: dict) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def check_blob_destination(account: str, container: str) -> None:
+    if not re.fullmatch(r"[a-z0-9]{3,24}", account):
+        raise PitrError("Storage account must contain 3-24 lowercase letters or digits")
+    if not re.fullmatch(r"(?=.{3,63}$)[a-z0-9]+(?:-[a-z0-9]+)*", container):
+        raise PitrError("Invalid Blob container name")
+
+
+def download_checkpoint(url: str, checkpoint: Path) -> None:
+    if checkpoint.exists() or checkpoint.is_symlink():
+        raise PitrError("Checkpoint download destination already exists; choose a new path")
+    parsed = urlsplit(url)
+    suffixes = "|".join(re.escape(suffix) for suffix in STORAGE_SUFFIXES)
+    host = re.fullmatch(rf"([a-z0-9]{{3,24}})\.blob\.({suffixes})", parsed.netloc)
+    parts = parsed.path.lstrip("/").split("/", 1)
+    if (
+        parsed.scheme != "https" or parsed.query or parsed.fragment or not host
+        or len(parts) != 2 or not parts[1] or parts[1].endswith("/")
+        or any(character.isspace() or ord(character) < 32 for character in url)
+    ):
+        raise PitrError("Use an HTTPS Azure Blob file URL without SAS, query, credentials or fragment")
+    check_blob_destination(host.group(1), parts[0])
+    scope = ("--blob-url", url, "--auth-mode", "login")
+    blob = az_json("storage", "blob", "show", *scope)
+    size = blob["properties"]["contentLength"]
+    etag = blob["properties"]["etag"]
+    if not isinstance(size, int) or not 0 < size <= MAX_CHECKPOINT_BYTES:
+        raise PitrError("Reference Blob size must be between 1 byte and 1 MiB")
+    if not isinstance(etag, str) or not etag:
+        raise PitrError("Azure did not return a reference Blob ETag")
+    descriptor, temporary = tempfile.mkstemp(prefix=".pitr-download-", suffix=".json", dir=checkpoint.parent)
+    os.close(descriptor)
+    temporary_path = Path(temporary)
+    try:
+        az_json(
+            "storage", "blob", "download", *scope, "--file", str(temporary_path),
+            "--if-match", etag, "--overwrite", "true", "--validate-content", "--no-progress",
+        )
+        if temporary_path.stat().st_size != size:
+            raise PitrError("Downloaded reference size differs from the Azure Blob metadata")
+        record = json.loads(temporary_path.read_text())
+        if not isinstance(record, dict) or record.get("format") != 1 or record.get("status") != "backup_ready":
+            raise PitrError("Downloaded reference is incomplete or unsupported")
+        write_json(checkpoint, record)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    print(f"Downloaded PITR recovery reference to {checkpoint}", file=sys.stderr)
+
+
 def take_pitr_backup(
     subscription: str, resource_group: str, source_server: str, checkpoint: Path,
     *, backup_name: str | None = None, quiesced: bool = False,
+    storage_account: str | None = None, blob_container: str | None = None,
 ) -> dict:
     """Create an Azure backup and save a verified recovery reference, not backup data."""
     if not quiesced:
         raise PitrError("quiesced=True/--quiesced is required: stop all writers, jobs and DDL first")
+    if storage_account is not None or blob_container is not None:
+        if not storage_account or not blob_container:
+            raise PitrError("--storage-account and --blob-container must be supplied together")
+        check_blob_destination(storage_account, blob_container)
     source_id = server_id(subscription, resource_group, source_server)
     if checkpoint.exists() or checkpoint.is_symlink():
         raise PitrError("Checkpoint file already exists; choose a new path")
@@ -167,6 +228,29 @@ def take_pitr_backup(
     check_window(after, point)
     record.update(status="backup_ready", restore_time=point)
     replace_record(checkpoint, record)
+    if storage_account and blob_container:
+        try:
+            cloud = az_json("cloud", "show")
+            suffix = cloud["suffixes"]["storageEndpoint"]
+            if suffix not in STORAGE_SUFFIXES:
+                raise PitrError("This Azure cloud's Blob endpoint is not supported")
+            name = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "/" + checkpoint.name
+            url = f"https://{storage_account}.blob.{suffix}/{blob_container}/{quote(name, safe='/')}"
+            record["checkpoint_blob_url"] = url
+            replace_record(checkpoint, record)
+            az_json(
+                "storage", "blob", "upload", "--subscription", subscription,
+                "--account-name", storage_account, "--container-name", blob_container,
+                "--name", name, "--file", str(checkpoint), "--auth-mode", "login",
+                "--overwrite", "false", "--content-type", "application/json",
+                "--validate-content", "--no-progress",
+            )
+        except PitrError as error:
+            raise PitrError(
+                f"Reference upload failed; Azure backup and local reference remain at {checkpoint}. "
+                f"Verify an independent copy before upgrading. {error}"
+            ) from error
+        print(f"PITR reference JSON uploaded (not database backup data): {url}", file=sys.stderr)
     print(
         f"Azure backup completed. Saved recovery reference: {checkpoint}\n"
         f"Restore timestamp: {point}; PostgreSQL {source['version']}.\n"
@@ -178,13 +262,15 @@ def take_pitr_backup(
 
 def restore_pitr_backup(
     checkpoint: Path, target_resource_group: str, target_server: str, report: Path,
-    *, confirm_target: str,
+    *, confirm_target: str, checkpoint_url: str | None = None,
 ) -> dict:
     """Ask Azure to create a new server at the saved pre-upgrade recovery point."""
     if confirm_target != target_server:
         raise PitrError("--confirm-target must exactly match the new target server name")
     if report.exists() or report.is_symlink():
         raise PitrError("Report already exists; choose a new path")
+    if checkpoint_url is not None:
+        download_checkpoint(checkpoint_url, checkpoint)
     record = json.loads(checkpoint.read_text())
     if record["format"] != 1 or record["status"] != "backup_ready":
         raise PitrError("Checkpoint is incomplete or unsupported; do not restore from it")
@@ -269,9 +355,12 @@ def main() -> int:
     backup.add_argument("--server", required=True)
     backup.add_argument("--checkpoint", type=Path, required=True, help="NEW recovery-reference JSON path")
     backup.add_argument("--backup-name", help="Unique Azure backup name; generated if omitted")
+    backup.add_argument("--storage-account", help="Optional account for uploading the reference JSON only")
+    backup.add_argument("--blob-container", help="Existing container; requires --storage-account")
     backup.add_argument("--quiesced", action="store_true", help="Confirm all writers, jobs and DDL are stopped")
     restore = operations.add_parser("restore", help="Create a NEW server from a saved recovery reference")
-    restore.add_argument("--checkpoint", type=Path, required=True)
+    restore.add_argument("--checkpoint", type=Path, required=True, help="Local reference, or NEW download path with --checkpoint-url")
+    restore.add_argument("--checkpoint-url", "--blob-url", help="Optional HTTPS Blob reference URL; Entra login only, no SAS")
     restore.add_argument("--target-resource-group", required=True, help="Existing RG in the source subscription")
     restore.add_argument("--target-server", required=True)
     restore.add_argument("--confirm-target", required=True)
@@ -283,11 +372,12 @@ def main() -> int:
                 take_pitr_backup(
                     args.subscription, args.resource_group, args.server, args.checkpoint,
                     backup_name=args.backup_name, quiesced=args.quiesced,
+                    storage_account=args.storage_account, blob_container=args.blob_container,
                 )
             else:
                 restore_pitr_backup(
                     args.checkpoint, args.target_resource_group, args.target_server, args.report,
-                    confirm_target=args.confirm_target,
+                    confirm_target=args.confirm_target, checkpoint_url=args.checkpoint_url,
                 )
     except (BackupError, OSError, ValueError, KeyError, TypeError) as error:
         print(f"ERROR: {error}", file=sys.stderr)

@@ -33,7 +33,10 @@ Restore likewise lets Azure handle its own service-managed database state.
   Existing published images must be rebuilt/pushed/redeployed to include this
   script. Azure CLI **2.93.0** command flags were checked during development.
 - Authenticate before running. For interactive use, run
-  `az login --use-device-code` using an approved account. For AKS automation,
+  `make azure-login` using an approved account (device-code login). To select a
+  tenant, use `make azure-login ARGS='--tenant YOUR_TENANT_UUID'`.
+  Run this inside the same toolbox container/pod as backup and restore; a laptop
+  login is not automatically shared with it. For AKS automation,
   configure an approved managed/workload identity integration and Azure CLI
   login explicitly; the script never selects a node identity automatically.
   The existing AKS manifests do not configure workload identity.
@@ -50,6 +53,8 @@ Restore likewise lets Azure handle its own service-managed database state.
 - The source must be `Ready` for backup. Its control-plane resource and named
   backup must still be accessible for normal PITR restore; the source database
   engine need not be operational or `Ready` when restoring.
+  On-demand backups are not supported on Burstable compute or SSDv2 storage;
+  uploading the reference to Blob Storage does not bypass these restrictions.
 - Choose an existing target resource group in the **same subscription**.
   This script restores in the **same region and network configuration** as
   the source. It supports the 16/18 workflow, not geo-restore or deleted-server
@@ -62,7 +67,7 @@ Restore likewise lets Azure handle its own service-managed database state.
   it does not stop applications.
 
 In the toolbox, `AZURE_CONFIG_DIR=/tmp/.azure` holds ephemeral CLI authentication.
-Do not bake credentials into the image or commit them. A pod restart removes
+Do not bake credentials into the image or commit them. Pod replacement removes
 this login state; reauthenticate when needed. The backup reference should be
 saved under persistent `/data`, **not** `/tmp`.
 
@@ -88,6 +93,48 @@ the backup in the Azure portal, and perform the manual upgrade. Run the normal
 post-upgrade data/application tests. Keeping the JSON does not extend backup
 retention.
 
+### Optional: upload the recovery reference to Blob Storage
+
+The storage account and private Blob container must already exist. Supply both
+optional arguments to upload **only the PITR reference JSON**, not database
+backup data:
+
+```bash
+make pitr-backup ARGS='--subscription 11111111-1111-1111-1111-111111111111 --resource-group production-rg --server production-pg --checkpoint /data/preupgrade-pitr.json --quiesced --storage-account migrationstore --blob-container pitr'
+```
+
+After the managed backup is verified, the command uploads to a virtual directory
+named with the current **UTC** time, formatted `YYYYMMDDHHMMSS`. Example:
+
+```text
+https://migrationstore.blob.core.windows.net/pitr/20261117124525/preupgrade-pitr.json
+```
+
+The command prints the URL and records it as `checkpoint_blob_url` in the
+reference. An existing Blob is never overwritten; a timestamp/name collision
+fails explicitly. The local reference remains available if upload fails, but
+the command returns nonzero. The URL field identifies the requested destination;
+it alone is not proof of successful upload. Verify an independent copy before
+upgrading. Do not retake a backup merely to retry copying an existing reference.
+
+All Blob operations explicitly use **`--auth-mode login`**. There is no storage
+key lookup, SAS generation, or anonymous-download fallback. Inherited
+`AZURE_STORAGE_*` environment variables are excluded from CLI subprocesses so
+keys, SAS tokens and connection strings cannot override Entra authentication.
+The same approved Azure CLI login is reused; rerun `make azure-login` if needed.
+
+The signed-in identity needs:
+
+- **Storage Blob Data Contributor** on the container/account to upload.
+- **Storage Blob Data Reader** (or Contributor) to download.
+- The separate PostgreSQL management permissions listed above to back up/restore.
+
+An ordinary management-plane Contributor assignment does not by itself grant
+Blob data access. Role assignments may take time to propagate. The pod/laptop
+must also reach the Blob HTTPS endpoint; storage firewalls, private endpoints
+and private DNS still apply. The helpers do not change RBAC or network settings.
+Use the same tenant identity with the required PostgreSQL and Blob permissions.
+
 ## 2. Restore only if rollback is required
 
 Do **not** pre-create an empty database server. Supply a globally unique,
@@ -99,6 +146,29 @@ make pitr-restore ARGS='--checkpoint /data/preupgrade-pitr.json --target-resourc
 
 The target RG must already exist. The explicit `--confirm-target` acknowledges
 creation of a **billable new Azure server**.
+
+To download a reference from Blob Storage first, add `--checkpoint-url`
+(`--blob-url` is an alias). `--checkpoint` then names a **new local download
+path**, whose parent must already exist:
+
+```bash
+make pitr-restore ARGS='--checkpoint-url https://migrationstore.blob.core.windows.net/pitr/20261117124525/preupgrade-pitr.json --checkpoint /data/downloaded-pitr.json --target-resource-group recovery-rg --target-server production-pg-recovery16 --confirm-target production-pg-recovery16 --report /data/pitr-restore-result.json'
+```
+
+Only HTTPS Blob file URLs on the standard Azure public, US Government and China
+endpoints are accepted. Do not supply a SAS token or query string. Custom domains,
+snapshot/version query URLs and Azure DNS-zone endpoint URLs are not supported.
+URLs use the normal Blob hostname even when private DNS routes it to a private
+endpoint.
+
+Download uses Entra authentication and the Blob's ETag to reject changes between
+metadata lookup and download. Empty files and files larger than **1 MiB** are
+rejected. The downloaded JSON must be a completed, supported PITR reference;
+it is saved locally with mode 0600 without overwriting an existing file.
+Failed downloads/invalid JSON never start a server restore. After a successful
+download, all normal tenant, source, timestamp, retention and target checks below
+still apply. If a later check fails, the downloaded file remains available; use
+`--checkpoint` without `--checkpoint-url` to reuse it.
 
 Restore:
 
@@ -156,15 +226,21 @@ restore_pitr_backup(
 )
 ```
 
+`take_pitr_backup` also accepts optional `storage_account` and `blob_container`
+keyword arguments. `restore_pitr_backup` accepts an optional `checkpoint_url`;
+the `checkpoint` argument is then the new local download destination.
+
 `PitrError` indicates an unsuccessful operation. Output JSON is created with
-mode 0600. Neither function logs in, changes the account default, changes backup
-retention, or deletes source/target resources.
+mode 0600. Neither function logs in automatically, changes the account default,
+changes backup retention, or deletes source/target resources. `make azure-login`
+is the separate explicit interactive authentication step.
 
 ## Limits and verification
 
 Built-in backups are in **Microsoft-managed storage**, not your PVC or your
-storage account. The PVC holds only the recovery reference/report. Retention
-is controlled by Azure/server settings (normally 7-35 days). On-demand backups
+storage account. The PVC holds the recovery reference/report; the optional Blob
+copy contains only the reference JSON. Retention is controlled by Azure/server
+settings (normally 7-35 days). On-demand backups
 are not an independent backup-vault archive.
 
 Do not delete the source server as a recovery step. Deleted-server recovery
@@ -175,15 +251,17 @@ fallback for an independent backup or a geo-recovery strategy.
 `make test` includes mocked Azure command-contract and safety tests. Those
 tests never call an Azure subscription. Container checks verify the installed
 CLI and command availability; **they do not prove a live Azure restore**.
+Blob transfer tests also use mocked CLI responses, not a live storage account.
 Rehearse both functions against a non-production Azure server before relying
 on this for production.
 
 ### Microsoft references
 
-Verified 2026-11-16:
+Verified 2026-11-17:
 
 - [On-demand backups](https://learn.microsoft.com/en-us/azure/postgresql/backup-restore/how-to-perform-backups)
 - [Exact Azure CLI backup flags](https://learn.microsoft.com/en-us/cli/azure/postgres/flexible-server/backup?view=azure-cli-latest)
 - [Restore to a custom point](https://learn.microsoft.com/en-us/azure/postgresql/backup-restore/how-to-restore-custom-restore-point)
 - [Backup completion timestamp API](https://learn.microsoft.com/en-us/rest/api/postgresql/backups-automatic-and-on-demand/get?view=rest-postgresql-2024-08-01)
 - [Upgrade rollback to an earlier version](https://learn.microsoft.com/en-us/azure/postgresql/configure-maintain/concepts-major-version-upgrade)
+- [Entra authorization for Blob CLI operations](https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-data-operations-cli)

@@ -5,7 +5,9 @@ Two independent workflows are available:
 - **[Azure-managed PITR backup and restore](PITR.md)**: `azure_pitr.py` creates an
   on-demand Azure backup, saves a recovery reference, then can ask Azure to
   create a new restored server. Recommended primary upgrade rollback path.
-  Run `make pitr-backup` and `make pitr-restore`.
+  Run `make azure-login`, then `make pitr-backup` and `make pitr-restore`.
+  Optional Entra-authenticated Blob upload/download stores the recovery-reference
+  JSON only; the database backup remains in Azure-managed storage.
 - **Logical backup and full-data comparison**, described below:
   `make backup`, `make restore`, and `make validate`.
 
