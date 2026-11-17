@@ -189,6 +189,48 @@ enterprise/custom CA, mount an approved PEM bundle read-only and set
 
 ## Publish and run on AKS
 
+### GitHub Actions and GHCR
+
+The [container workflow](.github/workflows/container.yml) builds on pull requests,
+pushes to `main`, and manual dispatch. Native GitHub-hosted AMD64 and ARM64
+runners build each architecture and run `make docker-test test-image-integration`
+against the packaged image. This includes synthetic PostgreSQL 16-to-16 and
+16-to-18 recovery; it does not access Azure or production databases.
+
+On `main`, each tested image is pushed to
+`ghcr.io/<lowercase-owner>/<lowercase-repository>:sha-<full-commit>-<architecture>`.
+Only after both architectures succeed does the publish job assemble and verify
+the combined `sha-<full-commit>` image, then promote it to `main` and `latest`.
+Pull requests never publish. Actions are pinned by commit SHA; build caches are
+separate per architecture. Builds use Docker's build action for its native
+Buildx/cache integration; validation and publishing operations use Make targets.
+
+Authentication uses the workflow's short-lived `GITHUB_TOKEN` with
+`contents: read` and `packages: write`. No PAT or Azure credentials are needed.
+Public actions and the Debian, PostgreSQL and Microsoft package repositories
+do not need a personal GitHub token. The token is not passed into the Docker
+build or stored in the image. Organisation policy can still restrict Actions
+or package publishing.
+
+**A public GitHub repository does not automatically make its GHCR package
+public.** After first publication, an administrator must check the package's
+settings and change its visibility to **Public** if anonymous pulls are wanted.
+Otherwise AKS needs an approved `imagePullSecret` with GHCR read access.
+The image source label links the package to this repository.
+
+For this repository:
+
+```bash
+docker pull ghcr.io/aksharagyana/az-postgresql:latest
+docker buildx imagetools inspect ghcr.io/aksharagyana/az-postgresql:latest
+```
+
+The Actions run summary includes the multi-platform manifest digest. Deploy
+that digest, not a moving tag. CI publishes images only; it does not deploy to
+AKS, authenticate to Azure, or run a real managed PITR operation.
+
+### Manual publishing and AKS
+
 **No image is pushed and no cluster resources are changed by `docker-build`.**
 Publish to an approved registry accessible to AKS:
 

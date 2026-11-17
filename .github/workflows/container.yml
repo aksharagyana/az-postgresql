@@ -1,0 +1,135 @@
+name: Container images
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}-${{ matrix.arch }}" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and load native image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Azure PostgreSQL backup, PITR and recovery toolbox
+          cache-from: type=gha,scope=toolbox-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=toolbox-${{ matrix.arch }}
+
+      - name: Test packaged commands and recover synthetic PostgreSQL 16 into 16 and 18
+        run: make docker-test test-image-integration IMAGE="$IMAGE"
+
+      - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push tested architecture image
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: make docker-push IMAGE="$IMAGE"
+
+  publish:
+    name: Publish multi-architecture image
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble commit image and verify both platforms
+        run: |
+          make docker-manifest IMAGE="$IMAGE:sha-$GITHUB_SHA" \
+            MANIFEST_SOURCES="$IMAGE:sha-$GITHUB_SHA-amd64 $IMAGE:sha-$GITHUB_SHA-arm64"
+          docker buildx imagetools inspect --raw "$IMAGE:sha-$GITHUB_SHA" |
+            jq --exit-status \
+              '[.manifests[].platform | select(.os == "linux") | .os + "/" + .architecture] |
+               sort == ["linux/amd64", "linux/arm64"]'
+
+      - name: Promote verified manifest to main and latest
+        run: |
+          make docker-manifest IMAGE="$IMAGE:main" IMAGE_TAGS="$IMAGE:latest" \
+            MANIFEST_SOURCES="$IMAGE:sha-$GITHUB_SHA"
+          {
+            echo '## Published container'
+            echo
+            echo "\`$IMAGE:sha-$GITHUB_SHA\`"
+            echo
+            echo 'Platforms: linux/amd64 and linux/arm64. Also tagged main and latest.'
+            echo
+            echo 'Use the manifest digest below for AKS deployments.'
+            echo '```text'
+            docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

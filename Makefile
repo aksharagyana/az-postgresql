@@ -7,18 +7,21 @@ PG_MAJOR ?=
 PG_BIN_DIR ?= $(if $(PG_MAJOR),/usr/lib/postgresql/$(PG_MAJOR)/bin,)
 SCHEMA_BIN_DIR ?=
 IMAGE ?= azure-postgresql-toolbox:local
+IMAGE_TAGS ?=
+MANIFEST_SOURCES ?=
 PLATFORM ?=
 PLATFORMS ?= linux/amd64,linux/arm64
 DATA_VOLUME ?= azure-postgresql-backups
 NAMESPACE ?= postgres-migration
 KUBECTL ?= kubectl
 
-.PHONY: help backup restore validate pitr-backup pitr-restore test test-integration test-image-integration docker-build docker-publish docker-run docker-test aks-render aks-deploy aks-shell
+.PHONY: help backup restore validate pitr-backup pitr-restore test test-integration test-image-integration docker-build docker-publish docker-push docker-manifest docker-run docker-test aks-render aks-deploy aks-shell
 help:
 	@$(PYTHON) server_backup.py --help
 	@echo ""
 	@echo "Container: make docker-build docker-test docker-run (IMAGE=...)"
 	@echo "Publish:   make docker-publish IMAGE=registry/image:tag"
+	@echo "CI:        make docker-push IMAGE=...; make docker-manifest IMAGE=... MANIFEST_SOURCES='...'"
 	@echo "AKS:       make aks-render aks-deploy aks-shell (IMAGE=... NAMESPACE=...)"
 	@echo "Clients:   PG_MAJOR=16 or 18 in the container; SCHEMA_BIN_DIR always uses 18"
 	@echo "Azure PITR: make pitr-backup or pitr-restore ARGS='...' (Azure login required)"
@@ -44,6 +47,14 @@ docker-build:
 docker-publish:
 	@test "$(IMAGE)" != "azure-postgresql-toolbox:local" || { echo "Set IMAGE to your approved registry/image:tag before publishing" >&2; exit 1; }
 	docker buildx build --platform "$(PLATFORMS)" --tag "$(IMAGE)" --push .
+
+docker-push:
+	@test "$(IMAGE)" != "azure-postgresql-toolbox:local" || { echo "Set IMAGE to your tested registry/image:tag before pushing" >&2; exit 1; }
+	docker push "$(IMAGE)"
+
+docker-manifest:
+	@test "$(IMAGE)" != "azure-postgresql-toolbox:local" && test -n "$(MANIFEST_SOURCES)" || { echo "Set IMAGE and MANIFEST_SOURCES before publishing a manifest" >&2; exit 1; }
+	docker buildx imagetools create --tag "$(IMAGE)" $(foreach tag,$(IMAGE_TAGS),--tag "$(tag)") $(MANIFEST_SOURCES)
 
 docker-run:
 	docker run --rm -it --read-only --cap-drop=ALL --security-opt=no-new-privileges \
