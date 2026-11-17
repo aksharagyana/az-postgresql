@@ -104,10 +104,10 @@ make pitr-backup ARGS='--subscription 11111111-1111-1111-1111-111111111111 --res
 ```
 
 After the managed backup is verified, the command uploads to a virtual directory
-named with the current **UTC** time, formatted `YYYYMMDDHHMMSS`. Example:
+named with the current **UTC** time, formatted `pitr-YYYYMMDDHHMMSS`. Example:
 
 ```text
-https://migrationstore.blob.core.windows.net/pitr/20261117124525/preupgrade-pitr.json
+https://migrationstore.blob.core.windows.net/pitr/pitr-20261117124525/preupgrade-pitr.json
 ```
 
 The command prints the URL and records it as `checkpoint_blob_url` in the
@@ -122,6 +122,12 @@ key lookup, SAS generation, or anonymous-download fallback. Inherited
 `AZURE_STORAGE_*` environment variables are excluded from CLI subprocesses so
 keys, SAS tokens and connection strings cannot override Entra authentication.
 The same approved Azure CLI login is reused; rerun `make azure-login` if needed.
+
+For **actual logical database dumps**, use
+[compressed data backup/restore](README.md#optional-compressed-data-backup-in-blob-storage)
+instead. Those archives use `data-YYYYMMDDHHMMSS/backup.tar.gz`; the `pitr-`
+prefix contains reference JSON only. Previously uploaded references under the
+older timestamp-only prefix remain valid restore inputs.
 
 The signed-in identity needs:
 
@@ -152,7 +158,7 @@ To download a reference from Blob Storage first, add `--checkpoint-url`
 path**, whose parent must already exist:
 
 ```bash
-make pitr-restore ARGS='--checkpoint-url https://migrationstore.blob.core.windows.net/pitr/20261117124525/preupgrade-pitr.json --checkpoint /data/downloaded-pitr.json --target-resource-group recovery-rg --target-server production-pg-recovery16 --confirm-target production-pg-recovery16 --report /data/pitr-restore-result.json'
+make pitr-restore ARGS='--checkpoint-url https://migrationstore.blob.core.windows.net/pitr/pitr-20261117124525/preupgrade-pitr.json --checkpoint /data/downloaded-pitr.json --target-resource-group recovery-rg --target-server production-pg-recovery16 --confirm-target production-pg-recovery16 --report /data/pitr-restore-result.json'
 ```
 
 Only HTTPS Blob file URLs on the standard Azure public, US Government and China

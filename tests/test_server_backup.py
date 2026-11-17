@@ -5,7 +5,9 @@ from pathlib import Path
 import sys
 import subprocess
 import tempfile
+import tarfile
 import unittest
+from unittest.mock import patch
 
 
 MODULE = Path(__file__).resolve().parents[1] / "server_backup.py"
@@ -128,6 +130,186 @@ class BackupSafetyTests(unittest.TestCase):
         result = subprocess.run(command + ["--quiesced"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("--confirm-target is required", result.stderr)
+
+    def logical_fixture(self, root):
+        root.mkdir()
+        (root / "database-0000.dump").write_bytes(b"synthetic database contents\n")
+        (root / "roles.sql").write_text("-- synthetic roles\n")
+        manifest = {
+            "format": 1, "source_host": "source", "source_port": 5432,
+            "source_major": 16, "admin": "migration_admin",
+            "archives": {"app": "database-0000.dump"},
+            "baseline": {"databases": {"app": {}}},
+            "files": {
+                name: self.tool.file_hash(root / name)
+                for name in ("database-0000.dump", "roles.sql")
+            },
+        }
+        self.tool.write_json(root / "manifest.json", manifest)
+        (root / "manifest.sha256").write_text(self.tool.file_hash(root / "manifest.json"))
+        return manifest
+
+    def test_compressed_archive_round_trip_preserves_data_and_excludes_unlisted_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, restored, archive = root / "source", root / "restored", root / "backup.tar.gz"
+            manifest = self.logical_fixture(source)
+            (source / "private-credentials.txt").write_text("synthetic:must-not-upload")
+            self.tool.create_backup_archive(source, archive)
+            self.tool.extract_backup_archive(archive, restored)
+            self.assertEqual(self.tool.load_backup(restored), manifest)
+            self.assertEqual(
+                (restored / "database-0000.dump").read_bytes(),
+                (source / "database-0000.dump").read_bytes(),
+            )
+            self.assertFalse((restored / "private-credentials.txt").exists())
+            self.assertEqual(restored.stat().st_mode & 0o777, 0o700)
+            for path in restored.iterdir():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(self.tool.BackupError, "already exists"):
+                self.tool.extract_backup_archive(archive, restored)
+            with patch.object(self.tool.shutil, "disk_usage") as usage:
+                usage.return_value.free = 1
+                with self.assertRaisesRegex(self.tool.BackupError, "free space"):
+                    self.tool.extract_backup_archive(archive, root / "no-space")
+            self.assertFalse((root / "no-space").exists())
+
+    def test_logical_upload_is_timestamped_compressed_and_entra_authenticated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "backup"
+            self.logical_fixture(root)
+            uploaded = {}
+
+            def az(*arguments):
+                if arguments[:2] == ("cloud", "show"):
+                    return {"suffixes": {"storageEndpoint": "core.windows.net"}}
+                archive = Path(arguments[arguments.index("--file") + 1])
+                uploaded["contents"] = archive.read_bytes()
+                uploaded["command"] = arguments
+                self.assertEqual(
+                    arguments[arguments.index("--metadata") + 1],
+                    "sha256=" + self.tool.file_hash(archive),
+                )
+                return {}
+
+            with patch.object(self.tool.blob, "az_json", side_effect=az):
+                url = self.tool.upload_backup(root, "migrationstore", "backups")
+            command = uploaded["command"]
+            self.assertEqual(command[:3], ("storage", "blob", "upload"))
+            self.assertEqual(command[command.index("--auth-mode") + 1], "login")
+            self.assertEqual(command[command.index("--overwrite") + 1], "false")
+            self.assertRegex(url, r"^https://migrationstore\.blob\.core\.windows\.net/backups/data-\d{14}/backup\.tar\.gz$")
+            with tarfile.open(fileobj=io.BytesIO(uploaded["contents"]), mode="r:gz") as archive:
+                self.assertEqual(
+                    archive.extractfile("database-0000.dump").read(),
+                    b"synthetic database contents\n",
+                )
+            self.assertEqual(sorted(path.name for path in root.parent.iterdir()), ["backup"])
+            with patch.object(self.tool.blob, "upload_file", side_effect=self.tool.BackupError("denied")), patch.object(
+                self.tool.blob, "blob_url", return_value=url,
+            ):
+                with self.assertRaisesRegex(self.tool.BackupError, "local backup remains"):
+                    self.tool.upload_backup(root, "migrationstore", "backups")
+            self.tool.load_backup(root)
+            self.assertEqual(sorted(path.name for path in root.parent.iterdir()), ["backup"])
+
+    def test_download_verifies_archive_and_file_checksums_before_database_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, archive = root / "source", root / "backup.tar.gz"
+            self.logical_fixture(source)
+            url = "https://migrationstore.blob.core.windows.net/backups/data-20261117130811/backup.tar.gz"
+            server = self.tool.Server("target", "migration_admin")
+            for failure in ("none", "archive-hash", "file-hash", "missing-hash"):
+                with self.subTest(failure=failure):
+                    (source / "database-0000.dump").write_bytes(b"synthetic database contents\n")
+                    self.tool.create_backup_archive(source, archive)
+                    if failure == "file-hash":
+                        with tarfile.open(archive, "w:gz") as output:
+                            for path in source.iterdir():
+                                if path.name == "database-0000.dump":
+                                    data = b"corrupted data"
+                                    member = tarfile.TarInfo(path.name)
+                                    member.size = len(data)
+                                    output.addfile(member, io.BytesIO(data))
+                                else:
+                                    output.add(path, arcname=path.name)
+                    contents = archive.read_bytes()
+                    digest = self.tool.file_hash(archive)
+                    metadata = {} if failure == "missing-hash" else {
+                        "sha256": "0" * 64 if failure == "archive-hash" else digest,
+                    }
+
+                    def az(*arguments):
+                        if arguments[:3] == ("storage", "blob", "show"):
+                            return {
+                                "properties": {"contentLength": len(contents), "etag": '"archive-etag"'},
+                                "metadata": metadata,
+                            }
+                        self.assertEqual(arguments[arguments.index("--auth-mode") + 1], "login")
+                        self.assertEqual(arguments[arguments.index("--if-match") + 1], '"archive-etag"')
+                        Path(arguments[arguments.index("--file") + 1]).write_bytes(contents)
+                        return {}
+
+                    destination = root / ("download-" + failure)
+                    with patch.object(self.tool.blob, "az_json", side_effect=az), patch.object(
+                        self.tool.Server, "check_clients",
+                    ) as clients:
+                        if failure == "none":
+                            self.tool.download_backup(url, destination)
+                            self.assertEqual(
+                                (destination / "database-0000.dump").read_bytes(),
+                                b"synthetic database contents\n",
+                            )
+                        else:
+                            with self.assertRaisesRegex(self.tool.BackupError, "[Cc]hecksum|SHA-256"):
+                                self.tool.restore_server(
+                                    server, destination, root / "report.json", server.host,
+                                    backup_url=url,
+                                )
+                        clients.assert_not_called()
+                    self.assertFalse((root / "report.json").exists())
+                    archive.unlink()
+
+    def test_archive_rejects_paths_links_devices_and_duplicate_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (name, kind) in enumerate((
+                ("../outside", tarfile.REGTYPE), ("/absolute", tarfile.REGTYPE),
+                ("link", tarfile.SYMTYPE), ("hardlink", tarfile.LNKTYPE),
+                ("device", tarfile.CHRTYPE), ("directory", tarfile.DIRTYPE),
+                ("duplicate", tarfile.REGTYPE),
+            )):
+                with self.subTest(name=name):
+                    archive = root / f"malicious-{index}.tar.gz"
+                    with tarfile.open(archive, "w:gz") as output:
+                        member = tarfile.TarInfo(name)
+                        member.type = kind
+                        member.linkname = "../outside" if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE) else ""
+                        output.addfile(member)
+                        if name == "duplicate":
+                            output.addfile(member)
+                    destination = root / f"restored-{index}"
+                    with self.assertRaisesRegex(self.tool.BackupError, "[Uu]nsafe|[Dd]uplicate"):
+                        self.tool.extract_backup_archive(archive, destination)
+                    self.assertFalse(destination.exists())
+            self.assertFalse((root / "outside").exists())
+
+    def test_blob_options_fail_before_database_or_existing_directory_changes(self):
+        server = self.tool.Server("target", "migration_admin")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(self.tool.Server, "check_clients") as clients:
+                with self.assertRaisesRegex(self.tool.BackupError, "together"):
+                    self.tool.backup_server(server, root / "new", storage_account="migrationstore")
+                clients.assert_not_called()
+                self.assertFalse((root / "new").exists())
+            with patch.object(self.tool.blob, "az_json") as azure:
+                with self.assertRaisesRegex(self.tool.BackupError, "already exists"):
+                    self.tool.download_backup(
+                        "https://migrationstore.blob.core.windows.net/backups/archive.tar.gz", root,
+                    )
+                azure.assert_not_called()
 
 
 if __name__ == "__main__":

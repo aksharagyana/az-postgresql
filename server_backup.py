@@ -2,7 +2,6 @@
 """Offline logical backup, fresh-server restore, and full-content comparison."""
 
 import argparse
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -13,12 +12,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
-from typing import BinaryIO, Iterator
+from typing import BinaryIO
 
+import azure_blob as blob
+from backup_common import BackupError, private_files, write_json
 
-class BackupError(RuntimeError):
-    pass
 
 
 MANAGED_DATABASES = {"azure_sys", "azure_maintenance", "template0", "template1"}
@@ -41,12 +41,6 @@ def ident(value: str) -> str:
 
 def literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
-
-
-def write_json(path: Path, value: object) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w") as stream:
-        stream.write(json.dumps(value, indent=2, ensure_ascii=True) + "\n")
 
 
 def file_hash(path: Path) -> str:
@@ -515,7 +509,96 @@ def load_backup(root: Path) -> dict:
     return manifest
 
 
-def backup_server(server: Server, root: Path) -> None:
+def create_backup_archive(root: Path, archive: Path) -> None:
+    manifest = load_backup(root)
+    descriptor = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        with tarfile.open(fileobj=stream, mode="w:gz", compresslevel=1, dereference=True) as output:
+            for name in ("manifest.json", "manifest.sha256", *manifest["files"]):
+                output.add(root / name, arcname=name, recursive=False)
+
+
+def extract_backup_archive(archive: Path, root: Path) -> None:
+    if root.exists() or root.is_symlink():
+        raise BackupError("Backup extraction directory already exists; choose a new path")
+    with tarfile.open(archive, "r:gz") as source:
+        members = []
+        names = set()
+        unpacked_size = 0
+        available = shutil.disk_usage(root.parent).free
+        for member in source:
+            if (
+                member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                or not member.name or member.name in (".", "..")
+                or Path(member.name).name != member.name or "\\" in member.name
+                or member.issparse() or member.size < 0
+            ):
+                raise BackupError(f"Unsafe archive member: {member.name!r}")
+            if member.name in names:
+                raise BackupError("Duplicate archive members are not allowed")
+            unpacked_size += member.size
+            if unpacked_size > available:
+                raise BackupError("Insufficient free space to decompress the backup archive")
+            names.add(member.name)
+            members.append(member)
+        if not {"manifest.json", "manifest.sha256"}.issubset(names):
+            raise BackupError("Archive is missing its backup manifest/checksum")
+        root.mkdir(mode=0o700, exist_ok=False)
+        for member in members:
+            contents = source.extractfile(member)
+            if contents is None:
+                raise BackupError(f"Cannot read archive member: {member.name!r}")
+            descriptor = os.open(root / member.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with contents, os.fdopen(descriptor, "wb") as output:
+                shutil.copyfileobj(contents, output)
+    manifest = load_backup(root)
+    if names != {"manifest.json", "manifest.sha256", *manifest["files"]}:
+        raise BackupError("Archive contains files outside the checksummed backup inventory")
+
+
+def upload_backup(root: Path, account: str, container: str) -> str:
+    blob.check_destination(account, container)
+    with tempfile.TemporaryDirectory(prefix="data-upload-", dir=root.parent) as directory:
+        archive = Path(directory) / "backup.tar.gz"
+        create_backup_archive(root, archive)
+        name = datetime.now(timezone.utc).strftime("data-%Y%m%d%H%M%S/backup.tar.gz")
+        url = blob.blob_url(account, container, name)
+        try:
+            blob.upload_file(
+                archive, account, container, name, content_type="application/gzip",
+                metadata={"sha256": file_hash(archive)},
+            )
+        except BackupError as error:
+            raise BackupError(
+                f"Logical backup upload failed; the complete local backup remains at {root}. {error}"
+            ) from error
+    print(f"Logical DATA backup uploaded: {url}", file=sys.stderr)
+    return url
+
+
+def download_backup(url: str, root: Path) -> None:
+    if root.exists() or root.is_symlink():
+        raise BackupError("Backup download directory already exists; choose a new path")
+    with tempfile.TemporaryDirectory(prefix="data-download-", dir=root.parent) as directory:
+        archive = Path(directory) / "backup.tar.gz"
+        properties = blob.download_file(url, archive)
+        metadata = properties.get("metadata")
+        expected = metadata.get("sha256") if isinstance(metadata, dict) else None
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise BackupError("Backup Blob is missing valid SHA-256 metadata")
+        if file_hash(archive) != expected:
+            raise BackupError("Compressed backup checksum mismatch")
+        extract_backup_archive(archive, root)
+    print(f"Logical DATA backup downloaded, decompressed and checksummed: {root}", file=sys.stderr)
+
+
+def backup_server(
+    server: Server, root: Path, *, storage_account: str | None = None, blob_container: str | None = None,
+) -> None:
+    if storage_account is not None or blob_container is not None:
+        if not storage_account or not blob_container:
+            raise BackupError("--storage-account and --blob-container must be supplied together")
+        blob.check_destination(storage_account, blob_container)
     server.check_clients("backup")
     root.mkdir(mode=0o700, parents=False, exist_ok=False)
     baseline = snapshot(server)
@@ -551,6 +634,8 @@ def backup_server(server: Server, root: Path) -> None:
     write_json(root / "manifest.json", manifest)
     (root / "manifest.sha256").write_text(file_hash(root / "manifest.json") + "\n")
     load_backup(root)
+    if storage_account and blob_container:
+        upload_backup(root, storage_account, blob_container)
     print(f"Backup complete and checksummed: {root}", file=sys.stderr)
     print(
         "Role passwords, Entra identities and Azure infrastructure are NOT backed up. "
@@ -639,12 +724,16 @@ def restore_public_grants(server: Server, database: str, grants: list[dict]) -> 
             raise BackupError(f"{database!r}: cannot safely replay public-schema grant chain")
 
 
-def restore_server(server: Server, root: Path, report: Path, confirm_target: str) -> None:
+def restore_server(
+    server: Server, root: Path, report: Path, confirm_target: str, *, backup_url: str | None = None,
+) -> None:
     if report.exists() or report.is_symlink():
         raise BackupError("Report path already exists; choose a new path before restoring")
-    manifest = load_backup(root)
     if confirm_target != server.host:
         raise BackupError("--confirm-target must exactly match --host")
+    if backup_url is not None:
+        download_backup(backup_url, root)
+    manifest = load_backup(root)
     if server.user != manifest["admin"]:
         raise BackupError("Provision the target with the same administrator role name as the source")
     if server.host == manifest["source_host"] and server.port == manifest["source_port"]:
@@ -732,27 +821,21 @@ def restore_server(server: Server, root: Path, report: Path, confirm_target: str
     )
 
 
-@contextmanager
-def private_files() -> Iterator[None]:
-    mask = os.umask(0o077)
-    try:
-        yield
-    finally:
-        os.umask(mask)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=("backup", "restore", "validate"))
     parser.add_argument("--host", required=True, help="Direct server FQDN, not a PgBouncer endpoint")
     parser.add_argument("--port", type=int, default=5432)
     parser.add_argument("--user", required=True, help="Server administrator; same name on both servers")
-    parser.add_argument("--backup-dir", type=Path, required=True, help="New directory for backup; existing for restore/validate")
+    parser.add_argument("--backup-dir", type=Path, required=True, help="New directory for backup/URL restore; existing for local restore/validate")
     parser.add_argument("--bin-dir", type=Path, help="Source-major clients for backup; target-major for restore")
     parser.add_argument("--schema-bin-dir", type=Path, help="PostgreSQL 18 pg_dump directory (also needed on source 16)")
     parser.add_argument("--quiesced", action="store_true", help="Confirm ALL writers, jobs and DDL are stopped")
     parser.add_argument("--confirm-target", help="Required for restore; repeat target hostname exactly")
     parser.add_argument("--report", type=Path, help="New JSON report path; required for restore/validate")
+    parser.add_argument("--storage-account", help="Backup only: upload the compressed data backup to this account")
+    parser.add_argument("--blob-container", help="Backup only: existing Blob container; requires --storage-account")
+    parser.add_argument("--backup-url", "--blob-url", help="Restore only: HTTPS Blob archive URL; --backup-dir must be new")
     args = parser.parse_args()
     if not args.quiesced:
         parser.error("--quiesced is mandatory; stop all traffic, background jobs, replication and DDL")
@@ -762,16 +845,26 @@ def main() -> int:
         parser.error("--confirm-target is required for restore")
     if args.report is not None and args.report.exists():
         parser.error("--report already exists; choose a new path")
+    if args.operation != "backup" and (args.storage_account is not None or args.blob_container is not None):
+        parser.error("--storage-account and --blob-container are only supported for backup")
+    if args.backup_url is not None and args.operation != "restore":
+        parser.error("--backup-url is only supported for restore")
     server = Server(args.host, args.user, args.port, args.bin_dir, args.schema_bin_dir)
     try:
         with private_files():
             if args.operation == "backup":
-                backup_server(server, args.backup_dir)
+                backup_server(
+                    server, args.backup_dir,
+                    storage_account=args.storage_account, blob_container=args.blob_container,
+                )
             elif args.operation == "restore":
-                restore_server(server, args.backup_dir, args.report, args.confirm_target)
+                assert args.report is not None
+                restore_server(
+                    server, args.backup_dir, args.report, args.confirm_target, backup_url=args.backup_url,
+                )
             else:
                 validate_server(server, args.backup_dir, args.report)
-    except (BackupError, OSError, ValueError, KeyError) as error:
+    except (BackupError, OSError, ValueError, KeyError, tarfile.TarError, EOFError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         if args.operation == "restore":
             print(

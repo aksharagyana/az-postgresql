@@ -7,43 +7,16 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import sys
 import tempfile
-from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
-from server_backup import BackupError, private_files, write_json
+import azure_blob as blob
+from azure_blob import AzureError as PitrError
+from backup_common import BackupError, private_files, write_json
 
 
-STORAGE_SUFFIXES = ("core.windows.net", "core.usgovcloudapi.net", "core.chinacloudapi.cn")
 MAX_CHECKPOINT_BYTES = 1024 * 1024
-
-
-class PitrError(BackupError):
-    pass
-
-
-def az_json(*arguments: str) -> dict | list:
-    if not shutil.which("az"):
-        raise PitrError("Azure CLI is missing. Use the rebuilt toolbox image or install Azure CLI")
-    result = subprocess.run(
-        ["az", *arguments, "--output", "json", "--only-show-errors"],
-        capture_output=True, text=True, check=False,
-        env={
-            **{key: value for key, value in os.environ.items() if not key.startswith("AZURE_STORAGE_")},
-            "AZURE_CORE_COLLECT_TELEMETRY": "no",
-        },
-    )
-    if result.returncode:
-        raise PitrError(f"Azure CLI failed ({result.returncode}):\n{result.stderr.strip()}")
-    if result.stderr.strip():
-        print(result.stderr, file=sys.stderr, end="")
-    data = json.loads(result.stdout)
-    if not isinstance(data, (dict, list)):
-        raise PitrError("Azure CLI returned an unexpected JSON response")
-    return data
 
 
 def utc_time(value: str) -> datetime:
@@ -119,51 +92,16 @@ def replace_record(path: Path, record: dict) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def check_blob_destination(account: str, container: str) -> None:
-    if not re.fullmatch(r"[a-z0-9]{3,24}", account):
-        raise PitrError("Storage account must contain 3-24 lowercase letters or digits")
-    if not re.fullmatch(r"(?=.{3,63}$)[a-z0-9]+(?:-[a-z0-9]+)*", container):
-        raise PitrError("Invalid Blob container name")
-
-
 def download_checkpoint(url: str, checkpoint: Path) -> None:
     if checkpoint.exists() or checkpoint.is_symlink():
         raise PitrError("Checkpoint download destination already exists; choose a new path")
-    parsed = urlsplit(url)
-    suffixes = "|".join(re.escape(suffix) for suffix in STORAGE_SUFFIXES)
-    host = re.fullmatch(rf"([a-z0-9]{{3,24}})\.blob\.({suffixes})", parsed.netloc)
-    parts = parsed.path.lstrip("/").split("/", 1)
-    if (
-        parsed.scheme != "https" or parsed.query or parsed.fragment or not host
-        or len(parts) != 2 or not parts[1] or parts[1].endswith("/")
-        or any(character.isspace() or ord(character) < 32 for character in url)
-    ):
-        raise PitrError("Use an HTTPS Azure Blob file URL without SAS, query, credentials or fragment")
-    check_blob_destination(host.group(1), parts[0])
-    scope = ("--blob-url", url, "--auth-mode", "login")
-    blob = az_json("storage", "blob", "show", *scope)
-    size = blob["properties"]["contentLength"]
-    etag = blob["properties"]["etag"]
-    if not isinstance(size, int) or not 0 < size <= MAX_CHECKPOINT_BYTES:
-        raise PitrError("Reference Blob size must be between 1 byte and 1 MiB")
-    if not isinstance(etag, str) or not etag:
-        raise PitrError("Azure did not return a reference Blob ETag")
-    descriptor, temporary = tempfile.mkstemp(prefix=".pitr-download-", suffix=".json", dir=checkpoint.parent)
-    os.close(descriptor)
-    temporary_path = Path(temporary)
-    try:
-        az_json(
-            "storage", "blob", "download", *scope, "--file", str(temporary_path),
-            "--if-match", etag, "--overwrite", "true", "--validate-content", "--no-progress",
-        )
-        if temporary_path.stat().st_size != size:
-            raise PitrError("Downloaded reference size differs from the Azure Blob metadata")
+    with tempfile.TemporaryDirectory(prefix="pitr-download-", dir=checkpoint.parent) as directory:
+        temporary_path = Path(directory) / "reference.json"
+        blob.download_file(url, temporary_path, max_bytes=MAX_CHECKPOINT_BYTES)
         record = json.loads(temporary_path.read_text())
         if not isinstance(record, dict) or record.get("format") != 1 or record.get("status") != "backup_ready":
             raise PitrError("Downloaded reference is incomplete or unsupported")
         write_json(checkpoint, record)
-    finally:
-        temporary_path.unlink(missing_ok=True)
     print(f"Downloaded PITR recovery reference to {checkpoint}", file=sys.stderr)
 
 
@@ -178,7 +116,7 @@ def take_pitr_backup(
     if storage_account is not None or blob_container is not None:
         if not storage_account or not blob_container:
             raise PitrError("--storage-account and --blob-container must be supplied together")
-        check_blob_destination(storage_account, blob_container)
+        blob.check_destination(storage_account, blob_container)
     source_id = server_id(subscription, resource_group, source_server)
     if checkpoint.exists() or checkpoint.is_symlink():
         raise PitrError("Checkpoint file already exists; choose a new path")
@@ -187,10 +125,10 @@ def take_pitr_backup(
     )
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", backup_name):
         raise PitrError("Invalid backup name")
-    account = az_json("account", "show", "--subscription", subscription)
+    account = blob.az_json("account", "show", "--subscription", subscription)
     if not same_id(account["id"], subscription):
         raise PitrError("Azure subscription does not match the explicit subscription ID")
-    source = az_json("postgres", "flexible-server", "show", "--ids", source_id)
+    source = blob.az_json("postgres", "flexible-server", "show", "--ids", source_id)
     check_source(source, source_id)
     if source["state"] != "Ready":
         raise PitrError("Source must be Ready before taking the pre-upgrade backup")
@@ -200,7 +138,7 @@ def take_pitr_backup(
         "--subscription", subscription, "--resource-group", resource_group,
         "--server-name", source_server,
     )
-    backups = az_json("postgres", "flexible-server", "backup", "list", *scope)
+    backups = blob.az_json("postgres", "flexible-server", "backup", "list", *scope)
     if any(backup["name"].casefold() == backup_name.casefold() for backup in backups):
         raise PitrError("Backup name already exists; choose a new name")
     record = {
@@ -216,10 +154,10 @@ def take_pitr_backup(
     }
     write_json(checkpoint, record)
     print(f"Creating Azure-managed backup {backup_name!r}; keep all writers stopped", file=sys.stderr)
-    az_json("postgres", "flexible-server", "backup", "create", *scope, "--name", backup_name)
-    backup = az_json("postgres", "flexible-server", "backup", "show", *scope, "--name", backup_name)
+    blob.az_json("postgres", "flexible-server", "backup", "create", *scope, "--name", backup_name)
+    backup = blob.az_json("postgres", "flexible-server", "backup", "show", *scope, "--name", backup_name)
     point = completed_backup(backup, record["backup_id"])
-    after = az_json("postgres", "flexible-server", "show", "--ids", source_id)
+    after = blob.az_json("postgres", "flexible-server", "show", "--ids", source_id)
     check_source(after, source_id)
     if after["version"] != source["version"] or after["state"] != "Ready":
         raise PitrError("Source changed version/state during backup. Do NOT proceed with the upgrade")
@@ -230,20 +168,13 @@ def take_pitr_backup(
     replace_record(checkpoint, record)
     if storage_account and blob_container:
         try:
-            cloud = az_json("cloud", "show")
-            suffix = cloud["suffixes"]["storageEndpoint"]
-            if suffix not in STORAGE_SUFFIXES:
-                raise PitrError("This Azure cloud's Blob endpoint is not supported")
-            name = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "/" + checkpoint.name
-            url = f"https://{storage_account}.blob.{suffix}/{blob_container}/{quote(name, safe='/')}"
+            name = datetime.now(timezone.utc).strftime("pitr-%Y%m%d%H%M%S") + "/" + checkpoint.name
+            url = blob.blob_url(storage_account, blob_container, name)
             record["checkpoint_blob_url"] = url
             replace_record(checkpoint, record)
-            az_json(
-                "storage", "blob", "upload", "--subscription", subscription,
-                "--account-name", storage_account, "--container-name", blob_container,
-                "--name", name, "--file", str(checkpoint), "--auth-mode", "login",
-                "--overwrite", "false", "--content-type", "application/json",
-                "--validate-content", "--no-progress",
+            blob.upload_file(
+                checkpoint, storage_account, blob_container, name,
+                subscription=subscription, content_type="application/json",
             )
         except PitrError as error:
             raise PitrError(
@@ -284,10 +215,10 @@ def restore_pitr_backup(
     expected_backup_id = source_id + "/backups/" + record["backup_name"]
     if not same_id(expected_backup_id, record["backup_id"]):
         raise PitrError("Checkpoint backup resource ID does not match its source server")
-    account = az_json("account", "show", "--subscription", subscription)
+    account = blob.az_json("account", "show", "--subscription", subscription)
     if not same_id(account["id"], subscription) or not same_id(account["tenantId"], record["tenant_id"]):
         raise PitrError("Azure subscription/tenant differs from the saved checkpoint")
-    source = az_json("postgres", "flexible-server", "show", "--ids", source_id)
+    source = blob.az_json("postgres", "flexible-server", "show", "--ids", source_id)
     check_source(source, source_id)
     check_window(source, record["restore_time"])
     created = (source.get("systemData") or {}).get("createdAt")
@@ -295,14 +226,14 @@ def restore_pitr_backup(
         raise PitrError("Source creation metadata changed; it may have been deleted and recreated")
     if source["network"] != record["source_network"] or source["location"] != record["source_location"]:
         raise PitrError("Source network/location changed; restore needs a reviewed portal workflow")
-    backup = az_json(
+    backup = blob.az_json(
         "postgres", "flexible-server", "backup", "show",
         "--subscription", subscription, "--resource-group", record["source_resource_group"],
         "--server-name", record["source_server"], "--name", record["backup_name"],
     )
     if utc_time(completed_backup(backup, expected_backup_id)) != utc_time(record["restore_time"]):
         raise PitrError("Saved backup has changed; refusing to restore a different recovery point")
-    targets = az_json(
+    targets = blob.az_json(
         "postgres", "flexible-server", "list", "--subscription", subscription,
         "--resource-group", target_resource_group,
     )
@@ -316,13 +247,13 @@ def restore_pitr_backup(
     }
     write_json(report, result)
     print(f"Azure is creating and restoring NEW server {target_server!r}", file=sys.stderr)
-    az_json(
+    blob.az_json(
         "postgres", "flexible-server", "restore",
         "--subscription", subscription, "--resource-group", target_resource_group,
         "--name", target_server, "--source-server", source_id,
         "--restore-time", record["restore_time"], "--yes",
     )
-    target = az_json("postgres", "flexible-server", "show", "--ids", target_id)
+    target = blob.az_json("postgres", "flexible-server", "show", "--ids", target_id)
     if not same_id(target["id"], target_id) or target["state"] != "Ready":
         raise PitrError("Restored server is not Ready at the expected resource ID; inspect Azure")
     if target["version"] != record["source_version"]:

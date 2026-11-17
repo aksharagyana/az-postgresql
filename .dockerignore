@@ -5,6 +5,8 @@
 !PITR.md
 !server_backup.py
 !azure_pitr.py
+!azure_blob.py
+!backup_common.py
 !toolbox-entrypoint.sh
 !tests/
 !tests/*.py

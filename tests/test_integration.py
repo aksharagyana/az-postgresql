@@ -264,6 +264,13 @@ class RecoveryTests(unittest.TestCase):
         # A restarted toolbox retains the backup, but has a fresh /tmp.
         self.docker("restart", name)
         self.docker("exec", name, "test", "-f", "/data/preupgrade/manifest.json")
+        self.docker(
+            "exec", name, "python3", "-c",
+            "from pathlib import Path; from server_backup import create_backup_archive, extract_backup_archive; "
+            "create_backup_archive(Path('/data/preupgrade'), Path('/data/backup.tar.gz')); "
+            "extract_backup_archive(Path('/data/backup.tar.gz'), Path('/data/decompressed'))",
+        )
+        base = "--user migration_admin --backup-dir /data/decompressed --quiesced"
         for target, major in ((self.rollback, 16), (self.upgrade, 18)):
             report = f"/data/recovery-{major}.json"
             self.docker(

@@ -46,7 +46,7 @@ ENV PG_MAJOR=16 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /opt/postgresql-toolbox
-COPY Makefile server_backup.py azure_pitr.py toolbox-entrypoint.sh README.md PITR.md ./
+COPY Makefile server_backup.py azure_pitr.py azure_blob.py backup_common.py toolbox-entrypoint.sh README.md PITR.md ./
 COPY tests ./tests
 RUN install -m 0755 toolbox-entrypoint.sh /usr/local/bin/toolbox-entrypoint
 USER 10001:10001

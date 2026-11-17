@@ -73,7 +73,7 @@ class ManagedPitrTests(unittest.TestCase):
                 {"suffixes": {"storageEndpoint": "core.windows.net"}},
                 upload_error or {},
             ])
-        with patch.object(self.tool, "az_json", side_effect=responses) as azure:
+        with patch.object(self.tool.blob, "az_json", side_effect=responses) as azure:
             result = self.tool.take_pitr_backup(
                 SUBSCRIPTION, "source-rg", "source16", self.checkpoint,
                 backup_name="preupgrade", quiesced=True, **options,
@@ -81,7 +81,7 @@ class ManagedPitrTests(unittest.TestCase):
         return result, azure
 
     def restore(self, source=None, targets=None, restored=None):
-        with patch.object(self.tool, "az_json", side_effect=[
+        with patch.object(self.tool.blob, "az_json", side_effect=[
             {"id": SUBSCRIPTION, "tenantId": TENANT},
             source if source is not None else self.source,
             self.backup, targets if targets is not None else [],
@@ -120,7 +120,7 @@ class ManagedPitrTests(unittest.TestCase):
         self.assertEqual(result["restored_version"], "16")
 
     def test_backup_requires_stopped_writers_before_any_azure_call(self):
-        with patch.object(self.tool, "az_json") as azure:
+        with patch.object(self.tool.blob, "az_json") as azure:
             with self.assertRaisesRegex(self.tool.PitrError, "quiesced"):
                 self.tool.take_pitr_backup(
                     SUBSCRIPTION, "source-rg", "source16", self.checkpoint,
@@ -129,7 +129,7 @@ class ManagedPitrTests(unittest.TestCase):
 
     def test_incomplete_cloud_backup_is_not_reported_as_usable(self):
         incomplete = dict(self.backup, completedTime=None)
-        with patch.object(self.tool, "az_json", side_effect=[
+        with patch.object(self.tool.blob, "az_json", side_effect=[
             {"id": SUBSCRIPTION, "tenantId": TENANT},
             self.source, [], incomplete, incomplete,
         ]):
@@ -151,7 +151,7 @@ class ManagedPitrTests(unittest.TestCase):
         self.take_backup()
         with self.assertRaisesRegex(self.tool.PitrError, "already exists"):
             self.restore(targets=[self.target])
-        with patch.object(self.tool, "az_json") as azure:
+        with patch.object(self.tool.blob, "az_json") as azure:
             with self.assertRaisesRegex(self.tool.PitrError, "confirm-target"):
                 self.tool.restore_pitr_backup(
                     self.checkpoint, "recovery-rg", "recovery16",
@@ -167,7 +167,7 @@ class ManagedPitrTests(unittest.TestCase):
 
     def test_wrong_tenant_and_changed_backup_are_refused(self):
         self.take_backup()
-        with patch.object(self.tool, "az_json", return_value={
+        with patch.object(self.tool.blob, "az_json", return_value={
             "id": SUBSCRIPTION, "tenantId": "wrong-tenant",
         }):
             with self.assertRaisesRegex(self.tool.PitrError, "tenant"):
@@ -181,14 +181,14 @@ class ManagedPitrTests(unittest.TestCase):
 
     def test_existing_checkpoint_and_nonready_source_do_not_start_backup(self):
         self.checkpoint.write_text("do not overwrite")
-        with patch.object(self.tool, "az_json") as azure:
+        with patch.object(self.tool.blob, "az_json") as azure:
             with self.assertRaisesRegex(self.tool.PitrError, "already exists"):
                 self.tool.take_pitr_backup(
                     SUBSCRIPTION, "source-rg", "source16", self.checkpoint, quiesced=True,
                 )
             azure.assert_not_called()
         self.assertEqual(self.checkpoint.read_text(), "do not overwrite")
-        with patch.object(self.tool, "az_json", side_effect=[
+        with patch.object(self.tool.blob, "az_json", side_effect=[
             {"id": SUBSCRIPTION, "tenantId": TENANT},
             dict(self.source, state="Updating"),
         ]) as azure:
@@ -201,7 +201,7 @@ class ManagedPitrTests(unittest.TestCase):
 
     def test_azure_restore_failure_leaves_pending_report_and_propagates_error(self):
         self.take_backup()
-        with patch.object(self.tool, "az_json", side_effect=[
+        with patch.object(self.tool.blob, "az_json", side_effect=[
             {"id": SUBSCRIPTION, "tenantId": TENANT},
             self.source, self.backup, [],
             self.tool.PitrError("Azure restore failed: simulated capacity error"),
@@ -221,8 +221,8 @@ class ManagedPitrTests(unittest.TestCase):
         self.assertEqual(command[command.index("--overwrite") + 1], "false")
         self.assertEqual(command[command.index("--file") + 1], str(self.checkpoint))
         name = command[command.index("--name") + 1]
-        self.assertRegex(name, r"^\d{14}/checkpoint\.json$")
-        timestamp = datetime.strptime(name.split("/")[0], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        self.assertRegex(name, r"^pitr-\d{14}/checkpoint\.json$")
+        timestamp = datetime.strptime(name.split("/")[0], "pitr-%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
         self.assertLess(abs((datetime.now(timezone.utc) - timestamp).total_seconds()), 30)
         self.assertEqual(
             record["checkpoint_blob_url"],
@@ -237,7 +237,7 @@ class ManagedPitrTests(unittest.TestCase):
             {"storage_account": "INVALID", "blob_container": "pitr"},
             {"storage_account": "migrationstore", "blob_container": "bad--container"},
         ):
-            with self.subTest(options=options), patch.object(self.tool, "az_json") as azure:
+            with self.subTest(options=options), patch.object(self.tool.blob, "az_json") as azure:
                 with self.assertRaises(self.tool.PitrError):
                     self.tool.take_pitr_backup(
                         SUBSCRIPTION, "source-rg", "source16", self.checkpoint,
@@ -271,7 +271,7 @@ class ManagedPitrTests(unittest.TestCase):
             return next(responses)
 
         url = "https://migrationstore.blob.core.windows.net/pitr/20261117124525/checkpoint.json"
-        with patch.object(self.tool, "az_json", side_effect=az) as azure:
+        with patch.object(self.tool.blob, "az_json", side_effect=az) as azure:
             result = self.tool.restore_pitr_backup(
                 self.checkpoint, "recovery-rg", "recovery16", self.report,
                 confirm_target="recovery16", checkpoint_url=url,
@@ -293,7 +293,7 @@ class ManagedPitrTests(unittest.TestCase):
             "https://migrationstore.blob.core.windows.net/pitr/",
             "https://user@migrationstore.blob.core.windows.net/pitr/reference.json",
         ):
-            with self.subTest(url=url), patch.object(self.tool, "az_json") as azure:
+            with self.subTest(url=url), patch.object(self.tool.blob, "az_json") as azure:
                 with self.assertRaises(self.tool.PitrError):
                     self.tool.restore_pitr_backup(
                         self.checkpoint, "recovery-rg", "recovery16", self.report,
@@ -301,7 +301,7 @@ class ManagedPitrTests(unittest.TestCase):
                     )
                 azure.assert_not_called()
         self.take_backup()
-        with patch.object(self.tool, "az_json") as azure:
+        with patch.object(self.tool.blob, "az_json") as azure:
             with self.assertRaisesRegex(self.tool.PitrError, "already exists"):
                 self.tool.restore_pitr_backup(
                     self.checkpoint, "recovery-rg", "recovery16", self.report,
@@ -313,7 +313,7 @@ class ManagedPitrTests(unittest.TestCase):
     def test_failed_oversized_or_invalid_blob_never_creates_server_or_checkpoint(self):
         url = "https://migrationstore.blob.core.windows.net/pitr/reference.json"
         for size in (0, 1024 * 1024 + 1):
-            with self.subTest(size=size), patch.object(self.tool, "az_json", return_value={
+            with self.subTest(size=size), patch.object(self.tool.blob, "az_json", return_value={
                 "properties": {"contentLength": size, "etag": '"test-etag"'},
             }) as azure:
                 with self.assertRaisesRegex(self.tool.PitrError, "size"):
@@ -329,14 +329,14 @@ class ManagedPitrTests(unittest.TestCase):
             Path(arguments[arguments.index("--file") + 1]).write_text("not json")
             return {}
 
-        with patch.object(self.tool, "az_json", side_effect=az) as azure:
+        with patch.object(self.tool.blob, "az_json", side_effect=az) as azure:
             with self.assertRaises(ValueError):
                 self.tool.restore_pitr_backup(
                     self.checkpoint, "recovery-rg", "recovery16", self.report,
                     confirm_target="recovery16", checkpoint_url=url,
                 )
             self.assertEqual(azure.call_count, 2)
-        with patch.object(self.tool, "az_json", side_effect=[
+        with patch.object(self.tool.blob, "az_json", side_effect=[
             {"properties": {"contentLength": 8, "etag": '"test-etag"'}},
             self.tool.PitrError("Download denied"),
         ]):
@@ -354,13 +354,13 @@ class ManagedPitrTests(unittest.TestCase):
             "AZURE_STORAGE_KEY": "synthetic-test-key",
             "AZURE_STORAGE_SAS_TOKEN": "synthetic-test-sas",
             "AZURE_STORAGE_CONNECTION_STRING": "synthetic-test-connection",
-        }), patch.object(self.tool.shutil, "which", return_value="/usr/bin/az"), patch.object(
-            self.tool.subprocess, "run",
+        }), patch.object(self.tool.blob.shutil, "which", return_value="/usr/bin/az"), patch.object(
+            self.tool.blob.subprocess, "run",
         ) as run:
             run.return_value.returncode = 0
             run.return_value.stdout = "{}"
             run.return_value.stderr = ""
-            self.tool.az_json("storage", "blob", "show", "--auth-mode", "login")
+            self.tool.blob.az_json("storage", "blob", "show", "--auth-mode", "login")
         environment = run.call_args.kwargs["env"]
         for name in ("AZURE_STORAGE_KEY", "AZURE_STORAGE_SAS_TOKEN", "AZURE_STORAGE_CONNECTION_STRING"):
             self.assertNotIn(name, environment)

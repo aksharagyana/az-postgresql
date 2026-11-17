@@ -347,8 +347,8 @@ kubectl -n postgres-migration get pods -l app=postgres-toolbox
 kubectl -n postgres-migration cp POD_NAME:/data/pre-upgrade-16 /secure/backups/pre-upgrade-16
 ```
 
-For large backups use your approved storage-transfer workflow; the image does
-include AzCopy or configure storage credentials; Azure CLI is included.
+For independent storage, use the optional Entra-authenticated Blob upload and
+download below. Azure CLI is included; storage credentials are not.
 
 ## Backup, restore and validate commands
 
@@ -392,6 +392,81 @@ roles may be retained, but all their non-password attributes must match.
 Restore is not atomic across the whole server. On any failure, keep traffic
 stopped: the target can be partially populated. Inspect the error and use a
 new/reprovisioned target for a retry; there is no destructive retry switch.
+
+### Optional compressed data backup in Blob Storage
+
+Unlike the PITR reference JSON, this uploads **actual logical database contents**:
+all the application database dumps, roles and integrity baseline in one
+`backup.tar.gz`. Azure-managed defaults remain excluded exactly as for local
+backup. Only the manifest-listed backup files are bundled, not unrelated files
+placed in the directory. Custom-format PostgreSQL dumps are already compressed;
+the outer gzip primarily bundles them and compresses the SQL/JSON metadata.
+
+The storage account and private Blob container must already exist. Authenticate
+**inside the same toolbox container/pod** using Entra device-code login:
+
+```bash
+make azure-login ARGS='--tenant YOUR_TENANT_UUID'
+
+# Stop all writers, then back up locally and upload the verified compressed copy.
+make backup PG_MAJOR=16 ARGS='--host source.postgres.database.azure.com --user migration_admin --backup-dir /data/pre-upgrade-16 --quiesced --storage-account migrationstore --blob-container backups'
+```
+
+Both storage options must be supplied together. The command prints a URL such as:
+
+```text
+https://migrationstore.blob.core.windows.net/backups/data-20261117124525/backup.tar.gz
+```
+
+Prefixes use **UTC**, with clearly separate names even in the same container:
+
+| Prefix | Contents |
+| --- | --- |
+| `data-YYYYMMDDHHMMSS/backup.tar.gz` | Portable logical backup with actual application data |
+| `pitr-YYYYMMDDHHMMSS/preupgrade-pitr.json` | Reference to Azure-managed backups, not their data |
+
+Omitting the storage options preserves the local-only workflow. Upload never
+overwrites a Blob. On failure the command exits nonzero and the completed local
+backup remains; the temporary compressed copy is removed. Do not retake a live
+database backup just to retry uploading an existing one.
+
+To download, verify, decompress and restore into a **new, empty** server:
+
+```bash
+make restore PG_MAJOR=18 ARGS='--host recovery18.postgres.database.azure.com --confirm-target recovery18.postgres.database.azure.com --user migration_admin --backup-url https://migrationstore.blob.core.windows.net/backups/data-20261117124525/backup.tar.gz --backup-dir /data/downloaded-16 --report /data/recovery18-report.json --quiesced'
+```
+
+Use `PG_MAJOR=16` and a new version-16 target for recovery to 16. `--blob-url`
+is an alias for `--backup-url`. The extraction directory and report must be
+**new**, with existing writable parents. After download, the extracted backup
+remains available for `make validate` or another restore using `--backup-dir`
+**without** the URL option.
+
+Download requires this project's archive format and its `sha256` Blob metadata.
+The compressed SHA-256, ETag/size and all internal manifest/file checksums are
+verified **before any database connection**. Unsafe tar paths, links, devices,
+directories, duplicate entries and files outside the backup inventory are
+rejected. Files are extracted as 0600 under a 0700 directory without replaying
+archive ownership or permissions. Invalid extraction can leave an incomplete
+local directory; inspect it and choose a new path rather than overwriting it.
+Restore still runs the full data-integrity validation automatically.
+
+All transfers use `--auth-mode login`; no shared keys, connection strings or SAS
+URLs are accepted as authentication. The login needs **Storage Blob Data
+Contributor** to upload and **Storage Blob Data Reader** (or Contributor) to
+download, in addition to the normal PostgreSQL access. Storage firewall/private
+endpoint/DNS rules must allow HTTPS from the toolbox. Only standard HTTPS Azure
+public, US Government and China Blob URLs without query strings are supported.
+See [PITR authentication details](PITR.md#optional-upload-the-recovery-reference-to-blob-storage).
+
+Allow disk space for **the local backup plus its compressed archive on upload**,
+and **the downloaded archive plus its expanded files on restore**, in addition
+to normal backup/validation scratch space. Temporary archives use the backup
+directory's parent on the same volume and are removed after the transfer.
+Unlike PITR JSON, data archives have no 1-MiB limit; downloads/extraction check
+available disk space. Independently protect the Blob container and retention:
+uploading a backup does not configure immutability or disaster-recovery policy.
+Blob command-contract tests are mocked; rehearse a live transfer before production.
 
 ## Integrity validation and reports
 
@@ -441,6 +516,13 @@ Import the module and use `Server(...)`, `backup_server(server, directory)`,
 `validate_server(server, directory, report)`. Wrap calls in `private_files()`
 when embedding, and stop writers before invoking them. `BackupError` signals
 an unsuccessful operation; never continue cutover after it.
+
+`backup_server` also accepts `storage_account=` and `blob_container=`.
+`restore_server` accepts `backup_url=` with a new extraction directory.
+`upload_backup(directory, account, container)` uploads an existing validated
+backup and returns its URL, allowing transfer retries without a new database
+backup. `download_backup(url, directory)` verifies and extracts without touching
+a database. Both reuse the same Entra-only Blob helpers as PITR.
 
 ```bash
 make test
