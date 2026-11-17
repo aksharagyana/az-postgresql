@@ -15,7 +15,7 @@ DATA_VOLUME ?= azure-postgresql-backups
 NAMESPACE ?= postgres-migration
 KUBECTL ?= kubectl
 
-.PHONY: help backup restore validate azure-login pitr-backup pitr-restore test test-integration test-image-integration docker-build docker-publish docker-push docker-manifest docker-run docker-test aks-render aks-deploy aks-shell
+.PHONY: help backup restore validate compare-servers upgrade-check azure-login pitr-backup pitr-restore test test-integration test-image-integration docker-build docker-publish docker-push docker-manifest docker-run docker-test aks-render aks-deploy aks-shell
 help:
 	@$(PYTHON) server_backup.py --help
 	@echo ""
@@ -26,9 +26,14 @@ help:
 	@echo "Clients:   PG_MAJOR=16 or 18 in the container; SCHEMA_BIN_DIR always uses 18"
 	@echo "Azure PITR: make pitr-backup or pitr-restore ARGS='...' (Azure login required)"
 	@echo "Azure login: make azure-login ARGS='--tenant TENANT_UUID' (device code)"
+	@echo "Compare: make compare-servers ARGS='--source-host ... --destination-host ... --source-user ... --report ... --quiesced'"
+	@echo "Upgrade: make upgrade-check ARGS='--phase before|after --host ... --user ... --baseline ... --quiesced [--report ...]'"
 
 backup restore validate:
 	@$(PYTHON) server_backup.py $@ $(if $(PG_BIN_DIR),--bin-dir $(PG_BIN_DIR),) $(if $(SCHEMA_BIN_DIR),--schema-bin-dir $(SCHEMA_BIN_DIR),) $(ARGS)
+
+compare-servers upgrade-check:
+	@$(PYTHON) server_compare.py $@ $(if $(PG_BIN_DIR),--bin-dir $(PG_BIN_DIR),) $(if $(SCHEMA_BIN_DIR),--schema-bin-dir $(SCHEMA_BIN_DIR),) $(ARGS)
 
 pitr-backup pitr-restore:
 	@$(PYTHON) azure_pitr.py $(patsubst pitr-%,%,$@) $(ARGS)

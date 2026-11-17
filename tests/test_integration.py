@@ -40,6 +40,7 @@ class RecoveryTests(unittest.TestCase):
             name = cls.prefix + "-" + suffix
             cls.docker(
                 "run", "--detach", "--name", name, "--network", cls.prefix,
+                "--network-alias", name + "-endpoint",
                 "--mount", f"type=bind,source={cls.root},target={cls.root}",
                 "--env", "POSTGRES_HOST_AUTH_METHOD=trust",
                 "--env", "POSTGRES_USER=azuresu", "--env", "POSTGRES_DB=postgres",
@@ -256,6 +257,12 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.docker("inspect", "--format", "{{.State.Running}}", name), "true")
         self.assertEqual(self.docker("exec", name, "id", "-u"), "10001")
         self.docker("exec", name, "make", "test")
+        endpoint = self.source.host + "-endpoint"
+        upgrade_args = f"--host {endpoint} --user migration_admin --baseline /data/before.json --quiesced"
+        self.docker(
+            "exec", name, "make", "upgrade-check", "PG_MAJOR=18",
+            f"ARGS=--phase before {upgrade_args}",
+        )
         base = "--user migration_admin --backup-dir /data/preupgrade --quiesced"
         self.docker(
             "exec", name, "make", "backup", "PG_MAJOR=16",
@@ -283,6 +290,29 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(target.sql("app = weird", "SELECT public.answer()"), "42")
             self.assertEqual(target.sql("app = weird", "SELECT octet_length(lo_get(123456))"), "90000")
             self.assertEqual(target.sql("azure_sys", "SELECT value FROM public.service_state"), "managed")
+            comparison = f"/data/compare-{major}.json"
+            self.docker(
+                "exec", name, "make", "compare-servers", "PG_MAJOR=18",
+                f"ARGS=--source-host {self.source.host} --source-user migration_admin "
+                f"--destination-host {target.host} --report {comparison} --quiesced",
+            )
+            result = json.loads(self.docker("exec", name, "cat", comparison))
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["reference"]["source"]["major"], 16)
+            self.assertEqual(result["reference"]["destination"]["major"], major)
+        # Rehearse a stable endpoint switching from 16 to restored 18, not a real Azure upgrade.
+        self.docker("network", "disconnect", self.prefix, self.source.host)
+        self.docker("network", "connect", self.prefix, self.source.host)
+        self.docker("network", "disconnect", self.prefix, self.upgrade.host)
+        self.docker("network", "connect", "--alias", endpoint, self.prefix, self.upgrade.host)
+        self.docker(
+            "exec", name, "make", "upgrade-check", "PG_MAJOR=18",
+            f"ARGS=--phase after {upgrade_args} --report /data/after.json",
+        )
+        result = json.loads(self.docker("exec", name, "cat", "/data/after.json"))
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["reference"]["source"]["major"], 16)
+        self.assertEqual(result["reference"]["destination"]["major"], 18)
         self.upgrade.sql("app = weird", "UPDATE public.duplicates SET value='changed' WHERE value='same'")
         result = subprocess.run(
             ["docker", "exec", name, "make", "validate", "PG_MAJOR=18",
@@ -293,6 +323,22 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn("Integrity validation FAILED", result.stderr)
         report = json.loads(self.docker("exec", name, "cat", "/data/mismatch.json"))
         self.assertTrue(any("duplicates" in item for item in report["differences"]))
+        for operation, arguments, report_path in (
+            ("compare-servers",
+             f"--source-host {self.source.host} --source-user migration_admin "
+             f"--destination-host {self.upgrade.host} --quiesced", "/data/compare-mismatch.json"),
+            ("upgrade-check", f"--phase after {upgrade_args}", "/data/upgrade-mismatch.json"),
+        ):
+            result = subprocess.run(
+                ["docker", "exec", name, "make", operation, "PG_MAJOR=18",
+                 f"ARGS={arguments} --report {report_path}"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Integrity validation FAILED", result.stderr)
+            report = json.loads(self.docker("exec", name, "cat", report_path))
+            self.assertFalse(report["passed"])
+            self.assertTrue(any("duplicates" in item for item in report["differences"]))
 
 
 if __name__ == "__main__":

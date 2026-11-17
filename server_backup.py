@@ -659,17 +659,15 @@ def differences(expected: object, actual: object, path: str = "") -> list[str]:
     return [] if expected == actual else [f"Changed: {path}"]
 
 
-def validate_server(server: Server, root: Path, report: Path) -> None:
-    manifest = load_backup(root)
-    server.check_clients("validate")
-    if server.user != manifest["admin"]:
-        raise BackupError("Use the same administrator role name as the source; ownership is not remapped")
-    actual = snapshot(server)
-    mismatches = differences(manifest["baseline"], actual)
+def write_comparison_report(
+    expected: dict, actual: dict, report: Path, *, target: str, reference: dict | None = None,
+) -> None:
+    mismatches = differences(expected, actual)
     write_json(report, {
-        "passed": not mismatches, "target": server.host,
+        "passed": not mismatches, "target": target,
         "checked_utc": datetime.now(timezone.utc).isoformat(),
         "differences": mismatches, "actual": actual,
+        **({"reference": reference} if reference is not None else {}),
     })
     if mismatches:
         raise BackupError(
@@ -677,6 +675,15 @@ def validate_server(server: Server, root: Path, report: Path) -> None:
             + "\n".join(mismatches[:30])
         )
     print(f"Integrity validation PASSED: {report}", file=sys.stderr)
+
+
+def validate_server(server: Server, root: Path, report: Path) -> None:
+    manifest = load_backup(root)
+    server.check_clients("validate")
+    if server.user != manifest["admin"]:
+        raise BackupError("Use the same administrator role name as the source; ownership is not remapped")
+    actual = snapshot(server)
+    write_comparison_report(manifest["baseline"], actual, report, target=server.host)
 
 
 def portable_membership(row: dict, admin: str) -> bool:

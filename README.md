@@ -470,6 +470,76 @@ Blob command-contract tests are mocked; rehearse a live transfer before producti
 
 ## Integrity validation and reports
 
+### Compare two running servers: source is the reference
+
+Use this when both source and restored/migrated destination are available.
+Stop **all writers, jobs and DDL on both servers** for the entire comparison.
+These are full scans, not live replication/lag checks or row-count-only checks.
+They issue no restore or data/schema modification commands, but can cause
+substantial CPU, disk/network IO and schema-read locks.
+
+```bash
+make compare-servers PG_MAJOR=18 ARGS='--source-host source.postgres.database.azure.com --source-user migration_admin --destination-host recovery18.postgres.database.azure.com --report /data/source-destination.json --quiesced'
+```
+
+Ports default to 5432; optionally set `--source-port`/`--destination-port`.
+`--destination-user` defaults to `--source-user`. As with restore validation,
+both must use the **same administrator role name**: strict checks do not remap
+owners, grantors or role memberships. Passwords may differ; put both entries
+in the existing private `PGPASSFILE`, keyed by each host/port/user. Do not put
+passwords in `ARGS`. Use direct endpoints, not aliases pointing to the same
+server. Identical host/port inputs are refused.
+
+The source is always expected truth. Missing **and extra** destination databases,
+objects or roles fail, as do schema, grants, sequence, large-object and full-row
+fingerprint differences. An allowed upgrade-related difference is **not**
+automatically ignored; inspect the failed report before making a cutover decision.
+
+### In-place upgrade: dedicated before/after fingerprints
+
+Capture **before** upgrading, with all writers already stopped:
+
+```bash
+make upgrade-check PG_MAJOR=18 ARGS='--phase before --host source.postgres.database.azure.com --user migration_admin --baseline /data/preupgrade-integrity.json --quiesced'
+```
+
+This creates only `preupgrade-integrity.json` and
+`preupgrade-integrity.json.sha256`, both private (0600). It reads all application
+data but saves only metadata/fingerprints, not row contents or restorable dumps.
+**It is not a recoverable backup** and does not replace `make backup`/PITR.
+Use a new baseline path with an existing writable parent, preserve **both**
+files outside the ephemeral container, and never overwrite them after upgrading.
+An interrupted capture without a valid matching checksum is not usable.
+
+After the portal upgrade, keep traffic/jobs/DDL stopped and run:
+
+```bash
+make upgrade-check PG_MAJOR=18 ARGS='--phase after --host source.postgres.database.azure.com --user migration_admin --baseline /data/preupgrade-integrity.json --report /data/postupgrade-integrity.json --quiesced'
+```
+
+The host, port and administrator must exactly match the saved endpoint.
+The baseline checksum/format and endpoint are checked before database access.
+The original fingerprints are never replaced. PostgreSQL 16/18 are supported;
+`PG_MAJOR=18` selects the comparison clients on **both** runs, even before the
+16-to-18 upgrade, so the schema dumper stays identical. A pass compares logical
+state only; it does not certify that the engine upgrade itself completed.
+
+Both operations reuse the existing exhaustive comparison described below and
+protect/exclude Azure-managed defaults identically. They inherit all scan
+preflight restrictions (for example unsupported foreign tables, replication
+setups and managed-owned application objects fail explicitly). There is no
+cross-database/server atomic snapshot: `--quiesced` acknowledges your maintenance
+window; it does not stop applications, freeze databases or make live writes safe.
+If writes resume between before/after, legitimate writes are indistinguishable
+from upgrade changes.
+
+Reports must be new paths with existing writable parents. A completed comparison
+writes `passed`, `differences`, `actual` and a `reference` containing the source
+fingerprints and endpoint/major-version metadata. Differences exit nonzero;
+preflight or scan errors can occur before any report exists. Only proceed after
+a successful comparison **and** the required Azure/application smoke tests.
+Keep baselines/reports private: they contain schema/security metadata and hashes.
+
 `validate_server` compares the live server with the saved pre-upgrade baseline:
 
 1. Exact application database and custom role/membership inventories.
@@ -523,6 +593,11 @@ an unsuccessful operation; never continue cutover after it.
 backup and returns its URL, allowing transfer retries without a new database
 backup. `download_backup(url, directory)` verifies and extracts without touching
 a database. Both reuse the same Entra-only Blob helpers as PITR.
+
+For integrity-only workflows, `server_compare.py` exposes
+`compare_servers(source, destination, report, quiesced=True)`,
+`capture_upgrade_baseline(server, baseline, quiesced=True)` and
+`verify_upgrade(server, baseline, report, quiesced=True)`.
 
 ```bash
 make test

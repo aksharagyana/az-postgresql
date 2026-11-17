@@ -4,6 +4,7 @@
 !README.md
 !PITR.md
 !server_backup.py
+!server_compare.py
 !azure_pitr.py
 !azure_blob.py
 !backup_common.py
