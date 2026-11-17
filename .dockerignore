@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!Makefile
+!README.md
+!PITR.md
+!server_backup.py
+!azure_pitr.py
+!toolbox-entrypoint.sh
+!tests/
+!tests/*.py

@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-toolbox
+  namespace: postgres-migration
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres-toolbox
+  template:
+    metadata:
+      labels:
+        app: postgres-toolbox
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: toolbox
+          image: example.azurecr.io/azure-postgresql-toolbox:replace-me
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PGPASS_SOURCE
+              value: /var/run/postgresql-credentials/pgpass
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - test -r "$PGPASSFILE" && test -w /data && test -w "$TMPDIR"
+            initialDelaySeconds: 3
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: temporary
+              mountPath: /tmp
+            - name: credentials
+              mountPath: /var/run/postgresql-credentials
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-toolbox-data
+        - name: temporary
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: credentials
+          secret:
+            secretName: postgres-toolbox-pgpass
+            defaultMode: 0440
+            items:
+              - key: pgpass
+                path: pgpass
