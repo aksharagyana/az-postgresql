@@ -255,12 +255,26 @@ non-root execution. `Recreate` avoids two rollout replicas contending for the
 ReadWriteOnce disk. The readiness check verifies local storage/credential access,
 not database connectivity; no liveness probe kills a long-running operation.
 
+The Deployment is pinned to the verified public multi-architecture GHCR image
+from source commit `020c3f90b5e857535dc8067fd3c01705a6eb946c`:
+
+```text
+ghcr.io/aksharagyana/az-postgresql@sha256:d354dbeefb8642623b6a082caa2c913430f5552de7e5282a77772181c031727e
+```
+
+`make aks-render` and `make aks-deploy` default to the image in
+`k8s/deployment.yaml`, not the local Docker build tag. An explicit `IMAGE=...`
+still overrides it. Update the manifest pin after verifying a newer release;
+CI publishing `latest` does not automatically roll this Deployment.
+
 Before deploying:
 
 1. Confirm the AKS cluster/context and approved namespace. Restrict permission to
    exec into this pod and read its Secret/PVC; this pod has database admin access.
-2. Ensure AKS can pull from the registry (for ACR, configure its pull permissions
-   on the node identity). Logical operations need no Azure API credentials;
+2. Ensure AKS can reach `ghcr.io` and its image download endpoints. The pinned
+   package supports anonymous pulls, so no GHCR pull Secret is required.
+   If overriding with a private registry, configure its pull permissions.
+   Logical operations need no Azure API credentials;
    the PITR workflow requires a separate authorized Azure CLI login.
 3. Ensure node/pod networking and private DNS can reach both source and replacement
    PostgreSQL FQDNs on TCP 5432. Allow appropriate DNS egress and registry/storage
@@ -284,9 +298,9 @@ kubectl create namespace postgres-migration --dry-run=client -o yaml | kubectl a
 kubectl -n postgres-migration create secret generic postgres-toolbox-pgpass \
   --from-file=pgpass=/absolute/secure/path/pgpass
 
-# Review generated manifests before applying; substitute your actual image/digest.
-make aks-render IMAGE=myregistry.azurecr.io/azure-postgresql-toolbox:migration-1
-make aks-deploy IMAGE=myregistry.azurecr.io/azure-postgresql-toolbox:migration-1
+# Review generated manifests before applying; uses the pinned GHCR digest.
+make aks-render
+make aks-deploy
 make aks-shell
 ```
 

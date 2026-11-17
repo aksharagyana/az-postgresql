@@ -67,8 +67,10 @@ docker-test:
 		--tmpfs /data:rw,noexec,nosuid,uid=10001,gid=10001,mode=0700 \
 		"$(IMAGE)" bash -c 'make test && python3 azure_pitr.py --help && az postgres flexible-server backup create --help >/dev/null && az postgres flexible-server restore --help >/dev/null'
 
+aks-render aks-deploy: IMAGE = $(shell sed -n 's/^[[:space:]]*image: //p' k8s/deployment.yaml)
+
 aks-render:
-	@$(KUBECTL) kustomize k8s | sed 's|example.azurecr.io/azure-postgresql-toolbox:replace-me|$(IMAGE)|g; s|namespace: postgres-migration|namespace: $(NAMESPACE)|g; s|name: postgres-migration|name: $(NAMESPACE)|g'
+	@$(KUBECTL) kustomize k8s | sed 's|^\([[:space:]]*image: \).*|\1$(IMAGE)|; s|namespace: postgres-migration|namespace: $(NAMESPACE)|g; s|name: postgres-migration|name: $(NAMESPACE)|g'
 
 aks-deploy:
 	@test "$(IMAGE)" != "azure-postgresql-toolbox:local" || { echo "Set IMAGE to your pushed registry image/digest" >&2; exit 1; }

@@ -27,7 +27,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: toolbox
-          image: example.azurecr.io/azure-postgresql-toolbox:replace-me
+          image: ghcr.io/aksharagyana/az-postgresql@sha256:d354dbeefb8642623b6a082caa2c913430f5552de7e5282a77772181c031727e
           imagePullPolicy: IfNotPresent
           env:
             - name: PGPASS_SOURCE
